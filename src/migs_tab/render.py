@@ -42,6 +42,14 @@ _PAUSE_GAP_SECONDS = 0.8
 # Plus a hard exclusion list for sections we never want to render.
 _SKIP_LABELS = {"closing_remarks"}
 
+# Noise-reduction thresholds applied before rendering. basic-pitch is honest
+# about every pitch it hears, including sympathetic resonance and short
+# transients — these would clutter the tab without representing intentional
+# notes the player meant to land.
+_MIN_NOTE_DURATION = 0.08  # drop notes shorter than this (~ a single hop)
+_MIN_NOTE_VELOCITY = 35  # drop notes quieter than this on the 0..127 scale
+_DEDUPE_WINDOW = 0.10  # drop duplicate same-pitch notes within this many seconds
+
 # Demo-quality ranking when picking a canonical instance.
 _DEMO_QUALITY_RANK = {
     "slow-walkthrough": 3,
@@ -95,6 +103,7 @@ def render(
     frets_data = json.loads(paths.frets_json.read_text())
     overrides = _load_overrides(paths)
     notes = _apply_overrides(frets_data["notes"], overrides)
+    notes = _filter_noise(notes)
 
     rendered: list[RenderedSection] = []
     for section in sections_data["sections"]:
@@ -127,6 +136,47 @@ def render(
     tab_path.write_text(tab_text)
     md_path.write_text(_format_markdown(sections_data, rendered))
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# Noise filter
+# ---------------------------------------------------------------------------
+
+
+def _filter_noise(notes: list[dict]) -> list[dict]:
+    """Drop short, quiet, or duplicate notes before rendering."""
+    survivors: list[dict] = []
+    for n in notes:
+        dur = n.get("end", n["start"]) - n["start"]
+        if dur < _MIN_NOTE_DURATION:
+            continue
+        vel = n.get("velocity")
+        if vel is not None and vel < _MIN_NOTE_VELOCITY:
+            continue
+        survivors.append(n)
+
+    # Dedupe: per pitch, drop the second note if it starts within
+    # _DEDUPE_WINDOW of the first and ends within the first's window.
+    survivors.sort(key=lambda n: (n["pitch"], n["start"]))
+    out: list[dict] = []
+    last_by_pitch: dict[int, dict] = {}
+    for n in survivors:
+        prev = last_by_pitch.get(n["pitch"])
+        if prev is not None and n["start"] - prev["start"] <= _DEDUPE_WINDOW:
+            # Keep the louder / longer one; drop this if the prev was better.
+            prev_score = (prev.get("velocity", 0), prev.get("end", 0) - prev["start"])
+            this_score = (n.get("velocity", 0), n.get("end", 0) - n["start"])
+            if this_score > prev_score:
+                # Replace prev with current — find & swap.
+                out[-1 - out[::-1].index(prev)] = n  # noqa: RUF015
+                last_by_pitch[n["pitch"]] = n
+            continue
+        out.append(n)
+        last_by_pitch[n["pitch"]] = n
+
+    # Restore time order.
+    out.sort(key=lambda n: (n["start"], n["pitch"]))
+    return out
 
 
 # ---------------------------------------------------------------------------

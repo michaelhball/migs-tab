@@ -58,6 +58,12 @@ _DEDUPE_WINDOW = 0.10  # drop duplicate same-pitch notes within this many second
 # re-detection of that ringing string rather than a fresh pluck.
 _SUSTAIN_CONTRACTION = 0.05  # subtract this from the earlier note's end
 
+# Cross-instance voting: a canonical-instance note is kept only if its
+# (chord_name, pitch_class) pair appears in at least this many *other*
+# instances of the same section. 1 = "at least one other take confirms".
+# Skipped entirely for sections with only one instance.
+_CROSS_INSTANCE_MIN_SUPPORT = 1
+
 # Demo-quality ranking when picking a canonical instance.
 _DEMO_QUALITY_RANK = {
     "slow-walkthrough": 3,
@@ -121,6 +127,11 @@ def render(
     notes = _apply_overrides(frets_data["notes"], overrides)
     notes = _filter_noise(notes)
 
+    # Build cross-instance pitch-class support per section, so we can drop
+    # canonical-instance notes that no other take confirms.
+    chord_spans = _load_chord_spans_for_render(paths)
+    cross_support = _build_cross_instance_support(sections_data, notes, chord_spans)
+
     rendered: list[RenderedSection] = []
     for section in sections_data["sections"]:
         if section["label"] in _SKIP_LABELS:
@@ -131,6 +142,15 @@ def render(
         if canonical is None:
             continue
         section_notes = [n for n in notes if canonical["start"] <= n["start"] < canonical["end"]]
+        if not section_notes:
+            continue
+        section_notes = _apply_cross_instance_support(
+            section_notes,
+            chord_spans,
+            cross_support.get(section["label"], {}),
+            cross_support_min=_CROSS_INSTANCE_MIN_SUPPORT,
+            instance_count=len(section.get("instances", [])),
+        )
         if not section_notes:
             continue
         tempo_bpm, beat_times = _detect_beats(
@@ -160,6 +180,101 @@ def render(
     tab_path.write_text(tab_text)
     md_path.write_text(_format_markdown(sections_data, rendered))
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# Cross-instance voting
+# ---------------------------------------------------------------------------
+
+
+def _load_chord_spans_for_render(paths: VideoPaths) -> list[tuple[float, float, str]]:
+    """Same shape as fret._load_chord_spans, loaded here for cross-instance
+    voting. Returns [] if structure.json is missing."""
+    if not paths.structure_json.exists():
+        return []
+    data = json.loads(paths.structure_json.read_text())
+    spans: list[tuple[float, float, str]] = []
+    for seg in data.get("playing_segments", []):
+        for c in seg.get("chords", []):
+            spans.append((float(c["start"]), float(c["end"]), c["chord"]))
+    spans.sort(key=lambda x: x[0])
+    return spans
+
+
+def _chord_for_time(spans: list[tuple[float, float, str]], t: float) -> str | None:
+    for s, e, name in spans:
+        if s <= t < e:
+            return name
+        if s > t:
+            return None
+    return None
+
+
+def _build_cross_instance_support(
+    sections_data: dict,
+    notes: list[dict],
+    chord_spans: list[tuple[float, float, str]],
+) -> dict[str, dict[tuple[str, int], int]]:
+    """For each section, count *how many of its instances* contain each
+    (chord_name, MIDI pitch) pair (exact octave).
+
+    Returns ``{section_label: {(chord, midi_pitch): count}}``. We vote
+    on exact pitch (not pitch class) so an octave-misidentification
+    by basic-pitch on the canonical take gets caught when no other
+    instance reports the same pitch in the same chord context.
+    """
+    by_label: dict[str, dict[tuple[str, int], int]] = {}
+    notes_sorted = sorted(notes, key=lambda n: n["start"])
+
+    for section in sections_data.get("sections", []):
+        instances = section.get("instances", [])
+        if len(instances) < 2:
+            continue
+        per_pair_supports: dict[tuple[str, int], int] = {}
+        for inst in instances:
+            seen_in_instance: set[tuple[str, int]] = set()
+            for n in notes_sorted:
+                if n["start"] >= inst["end"]:
+                    break
+                if n["start"] < inst["start"]:
+                    continue
+                chord = _chord_for_time(chord_spans, n["start"])
+                if chord is None:
+                    continue
+                seen_in_instance.add((chord, n["pitch"]))
+            for pair in seen_in_instance:
+                per_pair_supports[pair] = per_pair_supports.get(pair, 0) + 1
+        by_label[section["label"]] = per_pair_supports
+    return by_label
+
+
+def _apply_cross_instance_support(
+    section_notes: list[dict],
+    chord_spans: list[tuple[float, float, str]],
+    pair_supports: dict[tuple[str, int], int],
+    cross_support_min: int,
+    instance_count: int,
+) -> list[dict]:
+    """Drop notes whose exact (chord, pitch) is in fewer than
+    ``cross_support_min + 1`` instances. Loud notes (velocity ≥ 75)
+    survive even without cross-instance backup — the canonical's
+    confidence on its own is decisive."""
+    if instance_count < 2 or not pair_supports:
+        return section_notes
+    threshold = cross_support_min + 1  # canonical counts as one
+    survivors: list[dict] = []
+    for n in section_notes:
+        chord = _chord_for_time(chord_spans, n["start"])
+        if chord is None:
+            survivors.append(n)
+            continue
+        pair = (chord, n["pitch"])
+        support = pair_supports.get(pair, 0)
+        if support >= threshold:
+            survivors.append(n)
+        elif n.get("velocity", 999) >= 75:
+            survivors.append(n)
+    return survivors
 
 
 # ---------------------------------------------------------------------------

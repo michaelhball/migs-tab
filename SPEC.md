@@ -115,6 +115,29 @@ migs-tab process <url>            # all of the above end-to-end
 Each subcommand operates on a URL and uses the same cache layout, so partial reruns are cheap. `process` runs all four phases in order, skipping any step whose output already exists (unless `--force` is passed).
 
 ## Open questions / future
-- basic-pitch is general-purpose; if accuracy is insufficient on acoustic guitar, evaluate MT3 as the upgrade path.
+
+### Future: non-standard tuning support
+
+The CLI currently hard-codes standard tuning `(E A D G B E)` everywhere. Supporting alternate tunings (drop D, DADGAD, half-step-down, open tunings, capo positions) is feasible but touches several layers. Sketch:
+
+1. **Detection.** Instructors almost always announce the tuning explicitly. The Claude skill should parse the captions for phrases like *"tune your low E down to D"*, *"we're in DADGAD"*, *"capo on the 3rd fret"*, *"drop D"*, *"half-step down"*. Output a `tuning.json` in the cache dir:
+   ```json
+   {"strings_midi": [38, 45, 50, 55, 59, 64], "capo": 0, "label": "Drop D"}
+   ```
+2. **Plumb tuning through fret.py.** Replace the module-level `STANDARD_TUNING` constant with a per-video lookup. `assign_frets` reads `tuning.json` if present, else falls back to standard. The Viterbi already enumerates `fret = pitch - tuning[string]` per string, so changing `tuning` automatically reshapes the option space.
+3. **Chord templates.** `_CHORD_TEMPLATES` is keyed by pitch → `(string, fret)` for standard tuning. Two options:
+   - Recompute the templates dynamically from open-chord *shapes* (e.g., E open shape = `[0,2,2,1,0,0]` strings 0..5) for whatever tuning is loaded. This is the cleaner long-term approach.
+   - Or maintain per-tuning template libraries (Drop-D set, DADGAD set, etc.) and pick based on `tuning.json`.
+4. **Capo.** Pitches are absolute, so a capo at fret N effectively raises every open string's pitch by N semitones. Two ways:
+   - Treat the capo as a virtual nut: tuning becomes `[t + N for t in standard]` and frets above the capo are relative.
+   - Or keep absolute frets and just label "capo N" in the tab header so the player knows.
+5. **Render.** Tab header shows the detected tuning + capo. The string letters `[e, B, G, D, A, E]` may need to change (e.g., for drop D the bottom line is `D`, not `E`).
+6. **Caption-driven LLM step.** The skill should set the tuning *before* `migs-tab frets` runs, since fret assignment depends on it. So the order becomes: download → separate → transcribe → structure → (LLM reads captions and writes `tuning.json`) → frets → render.
+
+Rough effort: ~half a day for steps 1-5 once we commit. Step 3 is the only nontrivial piece — dynamic chord-template generation requires writing chord *shapes* (string-relative fret offsets from the root) rather than the current pitch-keyed dictionaries.
+
+### Other open items
+- basic-pitch is general-purpose; if accuracy is insufficient on acoustic guitar, evaluate MT3 as the upgrade path (likely server-side because of GPU).
 - For phase-3 vision: a small open-source fret-detection CNN (trained on GuitarSet) could handle the easy cases locally before escalating to Claude — TBD whether that's worth the engineering.
 - The "other" stem from Demucs is a guitar proxy after vocal/drum/bass removal. If a tutorial has additional background music, isolation may be imperfect — consider htdemucs_ft (fine-tuned) or running Demucs in 6-source mode.
+- MusicXML export for Guitar Pro / MuseScore / TuxGuitar.

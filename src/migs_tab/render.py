@@ -53,6 +53,11 @@ _MIN_NOTE_DURATION = 0.08  # drop notes shorter than this (~ a single hop)
 _MIN_NOTE_VELOCITY = 35  # drop notes quieter than this on the 0..127 scale
 _DEDUPE_WINDOW = 0.10  # drop duplicate same-pitch notes within this many seconds
 
+# Sustain detection: a note whose onset falls inside (a slightly contracted
+# version of) an earlier same-pitch note's duration is treated as a
+# re-detection of that ringing string rather than a fresh pluck.
+_SUSTAIN_CONTRACTION = 0.05  # subtract this from the earlier note's end
+
 # Demo-quality ranking when picking a canonical instance.
 _DEMO_QUALITY_RANK = {
     "slow-walkthrough": 3,
@@ -233,7 +238,7 @@ def _subdivisions_from_beats(beat_times: list[float]) -> list[tuple[float, bool]
 
 
 def _filter_noise(notes: list[dict]) -> list[dict]:
-    """Drop short, quiet, or duplicate notes before rendering."""
+    """Drop short, quiet, duplicate, or sustained-continuation notes."""
     survivors: list[dict] = []
     for n in notes:
         dur = n.get("end", n["start"]) - n["start"]
@@ -244,27 +249,37 @@ def _filter_noise(notes: list[dict]) -> list[dict]:
             continue
         survivors.append(n)
 
-    # Dedupe: per pitch, drop the second note if it starts within
-    # _DEDUPE_WINDOW of the first and ends within the first's window.
+    # Dedupe close-onset same-pitch detections, prefer the louder/longer.
     survivors.sort(key=lambda n: (n["pitch"], n["start"]))
-    out: list[dict] = []
+    deduped: list[dict] = []
     last_by_pitch: dict[int, dict] = {}
     for n in survivors:
         prev = last_by_pitch.get(n["pitch"])
         if prev is not None and n["start"] - prev["start"] <= _DEDUPE_WINDOW:
-            # Keep the louder / longer one; drop this if the prev was better.
             prev_score = (prev.get("velocity", 0), prev.get("end", 0) - prev["start"])
             this_score = (n.get("velocity", 0), n.get("end", 0) - n["start"])
             if this_score > prev_score:
-                # Replace prev with current — find & swap.
-                out[-1 - out[::-1].index(prev)] = n  # noqa: RUF015
+                deduped[-1 - deduped[::-1].index(prev)] = n  # noqa: RUF015
                 last_by_pitch[n["pitch"]] = n
             continue
-        out.append(n)
+        deduped.append(n)
         last_by_pitch[n["pitch"]] = n
 
-    # Restore time order.
-    out.sort(key=lambda n: (n["start"], n["pitch"]))
+    # Sustain detection: scan in time order. For each note, look at the most
+    # recent same-pitch note that we kept; if THIS note's onset falls inside
+    # (prev.start, prev.end - _SUSTAIN_CONTRACTION), the new "onset" is most
+    # likely a re-detection of the still-ringing string, so drop it.
+    deduped.sort(key=lambda n: (n["start"], n["pitch"]))
+    out: list[dict] = []
+    last_kept_by_pitch: dict[int, dict] = {}
+    for n in deduped:
+        prev = last_kept_by_pitch.get(n["pitch"])
+        if prev is not None:
+            prev_end_contracted = prev.get("end", prev["start"]) - _SUSTAIN_CONTRACTION
+            if prev["start"] < n["start"] < prev_end_contracted:
+                continue
+        out.append(n)
+        last_kept_by_pitch[n["pitch"]] = n
     return out
 
 
@@ -435,22 +450,40 @@ def _nearest_index(sorted_times: list[float], t: float) -> int:
 
 
 def _pack_quantized(cells: list[list[str]], markers: list[str], line_width: int) -> str:
-    """Pack beat-quantized cells into systems, drawing bar lines and a
-    slightly-wider separator at beats."""
+    """Pack beat-quantized cells into systems, wrapping at bar boundaries.
+
+    Each subdivision-cell is prefixed by `|` (when it starts a new bar) or
+    `-` (otherwise). When a new bar boundary is reached and the in-progress
+    line is already at or beyond the line-width budget, wrap there — the
+    completed bars become a system and the new bar's first cell starts
+    the next system. A closing `|` is appended to the very last system.
+    """
     if not cells:
         return ""
     systems: list[list[str]] = []
     current = ["" for _ in range(6)]
-    for cell, marker in zip(cells, markers, strict=True):
-        cell_width = len(cell[0])
-        sep = "|" if marker == "bar" else "-"
-        added = cell_width + 1
-        if current[0] and len(current[0]) + added > line_width - 4:
-            systems.append(current)
-            current = ["" for _ in range(6)]
+
+    for idx, (cell, marker) in enumerate(zip(cells, markers, strict=True)):
+        if idx == 0:
+            prefix = ""
+        elif marker == "bar":
+            prefix = "|"
+        else:
+            prefix = "-"
         for i in range(6):
-            current[i] += cell[i] + sep
+            current[i] += prefix + cell[i]
+        # Wrap only when we just placed a `|` AND we're past the budget.
+        if marker == "bar" and idx > 0 and len(current[0]) > line_width - 4:
+            bar_end = len(current[0]) - len(cell[0])
+            wrapped = [line[:bar_end] for line in current]
+            leftover = [line[bar_end:] for line in current]
+            systems.append(wrapped)
+            current = leftover
+
+    # Close out the final system with a trailing bar line.
     if current[0]:
+        for i in range(6):
+            current[i] += "|"
         systems.append(current)
 
     parts: list[str] = []

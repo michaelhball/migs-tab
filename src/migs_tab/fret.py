@@ -44,13 +44,13 @@ PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # 4 fret reach is comfortable; 5 is a stretch; 6+ is rare. We allow up to 5.
 MAX_HAND_SPAN = 5
 
-# Onset cluster window — notes whose onsets fall within this many seconds of
-# each other are considered "played together" (a chord stab, a pinch, the
-# start of an arpeggio that all comes from one hand position). 0.06s was too
-# tight — basic-pitch jitters chord onsets by 20-50ms and a strummed chord
-# often spans ~100ms. 0.15s captures strummed chords while still keeping
-# arpeggio notes in distinct clusters.
-ONSET_CLUSTER_SECONDS = 0.15
+# Onset clustering uses a rolling gap-based anchor with a max-duration cap.
+# Two consecutive notes within ``ONSET_CLUSTER_GAP`` go into the same
+# cluster (anchor updates to the latest note). A cluster stops growing
+# once its total span hits ``MAX_CLUSTER_DURATION`` — keeps long runs of
+# semi-related arpeggio notes from being mashed into one column.
+ONSET_CLUSTER_GAP = 0.18
+MAX_CLUSTER_DURATION = 0.40
 
 # Weights for the cluster's intrinsic cost (lower = better).
 # Tuned so an open-position shape scores strongly negative (driving the
@@ -315,7 +315,8 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         "params": {
             "max_fret": MAX_FRET,
             "max_hand_span": MAX_HAND_SPAN,
-            "onset_cluster_seconds": ONSET_CLUSTER_SECONDS,
+            "onset_cluster_gap": ONSET_CLUSTER_GAP,
+            "max_cluster_duration": MAX_CLUSTER_DURATION,
             "ambiguity_margin": _AMBIGUITY_MARGIN,
         },
         "clusters": cluster_records,
@@ -450,26 +451,38 @@ def _dedupe_same_pitch_onsets(notes: list[dict]) -> list[dict]:
 
 
 def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
-    """Return a list of clusters, each a list of note indices.
+    """Return clusters of note indices grouped by a rolling onset gap.
 
-    Two notes are in the same cluster iff their onsets are within
-    ``ONSET_CLUSTER_SECONDS`` AND they're on different pitches with
-    a reasonable hand-shape (we enforce the latter at enumerate time).
+    A new note joins the current cluster iff:
+      - the gap from the most recent note is ≤ ``ONSET_CLUSTER_GAP``, AND
+      - the new note's onset is ≤ ``MAX_CLUSTER_DURATION`` after the cluster's
+        first onset (so a slow steady stream of notes doesn't merge forever).
+
+    Otherwise a new cluster is started. Captures strummed chord stabs that
+    spread across ~150-250ms while keeping distinct arpeggio attacks apart.
     """
     indexed = sorted(range(len(notes)), key=lambda i: notes[i]["start"])
     clusters: list[list[int]] = []
     current: list[int] = []
-    current_anchor: float | None = None
+    cluster_start: float | None = None
+    last_onset: float | None = None
     for i in indexed:
         s = notes[i]["start"]
-        if current_anchor is None or s - current_anchor <= ONSET_CLUSTER_SECONDS:
+        join = (
+            current
+            and last_onset is not None
+            and cluster_start is not None
+            and (s - last_onset) <= ONSET_CLUSTER_GAP
+            and (s - cluster_start) <= MAX_CLUSTER_DURATION
+        )
+        if join:
             current.append(i)
-            if current_anchor is None:
-                current_anchor = s
         else:
-            clusters.append(current)
+            if current:
+                clusters.append(current)
             current = [i]
-            current_anchor = s
+            cluster_start = s
+        last_onset = s
     if current:
         clusters.append(current)
     return clusters

@@ -7,9 +7,11 @@ import warnings
 logging.getLogger().setLevel(logging.WARNING)
 for _name in ("root", "basic_pitch"):
     logging.getLogger(_name).addFilter(
-        lambda r: not (
-            "tflite-runtime is not installed" in r.getMessage()
-            or "Tensorflow is not installed" in r.getMessage()
+        lambda r: (
+            not (
+                "tflite-runtime is not installed" in r.getMessage()
+                or "Tensorflow is not installed" in r.getMessage()
+            )
         )
     )
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")

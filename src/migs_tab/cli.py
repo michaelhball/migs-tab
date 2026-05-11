@@ -15,6 +15,7 @@ import typer
 from rich.console import Console
 
 from . import download as download_mod
+from . import frames as frames_mod
 from . import fret as fret_mod
 from . import separate as separate_mod
 from . import structure as structure_mod
@@ -135,6 +136,55 @@ def frets(
     console.print(f"[bold]Assigning frets[/bold] for {paths.video_id}")
     fret_mod.assign_frets(paths, force=force)
     _print_status(paths)
+
+
+@app.command()
+def frame(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    timestamp: float = typer.Argument(..., help="Time in seconds to grab a frame"),
+    label: str = typer.Option("", "--label", help="Suffix to append to the filename"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+) -> None:
+    """Extract a single still frame from the video at the given timestamp."""
+    paths = _make_paths(url, cache_dir)
+    out = frames_mod.extract_frame(paths, timestamp, label=label or None)
+    console.print(f"[green]✓[/green] {out}")
+
+
+@app.command(name="frames-for-clusters")
+def frames_for_clusters(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cluster_ids: str = typer.Argument(..., help="Comma-separated cluster IDs from frets.json"),
+    max_frames: int = typer.Option(
+        10,
+        "--max-frames",
+        help="Hard ceiling on the number of frames extracted. Protects against runaway vision-pass costs.",
+    ),
+    subdir: str = typer.Option("ambiguous", "--subdir"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+) -> None:
+    """Extract one video frame per cluster ID for the LLM vision pass."""
+    paths = _make_paths(url, cache_dir)
+    ids = [int(s) for s in cluster_ids.split(",") if s.strip()]
+    if not ids:
+        raise typer.BadParameter("provide at least one cluster id")
+    result = frames_mod.extract_frames_for_clusters(
+        paths, ids, max_frames=max_frames, subdir=subdir
+    )
+    console.print(
+        f"[green]✓[/green] {result['extracted_count']} frames written to "
+        f"{paths.frames_dir / subdir}"
+        + (
+            f" ([yellow]{result['skipped_due_to_cap']} skipped[/yellow] due to --max-frames cap)"
+            if result["skipped_due_to_cap"]
+            else ""
+        )
+    )
+    for rec in result["cluster_records"]:
+        console.print(
+            f"  cluster {rec['cluster_id']:>4}  onset {rec.get('onset', '?'):>7.2f}s  "
+            f"→ {rec.get('frame_path', '<error>')}"
+        )
 
 
 @app.command()

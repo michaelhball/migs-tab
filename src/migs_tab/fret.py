@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from itertools import product
-from pathlib import Path
 
 from .paths import VideoPaths
 
@@ -58,13 +57,13 @@ ONSET_CLUSTER_SECONDS = 0.15
 # 7-12 score notably higher. Hand-movement is intentionally light: tutorials
 # do move the hand around, so penalizing motion too hard locks the
 # algorithm into one position for the whole song.
-_W_FRET_POSITION = 0.15   # average fret position (strong pull to low frets)
-_W_FRET_SPAN = 0.6        # max-min fret span (encourage compact shapes)
-_W_OPEN_BONUS = -0.8      # per open string in the shape (strong reward)
-_W_HIGH_FRET_PENALTY = 0.4   # extra penalty above fret 12
+_W_FRET_POSITION = 0.15  # average fret position (strong pull to low frets)
+_W_FRET_SPAN = 0.6  # max-min fret span (encourage compact shapes)
+_W_OPEN_BONUS = -0.8  # per open string in the shape (strong reward)
+_W_HIGH_FRET_PENALTY = 0.4  # extra penalty above fret 12
 
 # Weights for the transition cost between consecutive clusters.
-_W_HAND_MOVE = 0.35       # change in average fret position (light)
+_W_HAND_MOVE = 0.35  # change in average fret position (light)
 _W_STRING_PRESERVE = -0.15  # bonus per note still on the same string
 
 # An assignment is "ambiguous" if the runner-up shape was within this delta.
@@ -85,7 +84,7 @@ class FretAssign:
     the original notes list."""
 
     note_index: int
-    string: int   # 0 = low E, 5 = high E
+    string: int  # 0 = low E, 5 = high E
     fret: int
 
 
@@ -141,7 +140,7 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
     # outside guitar range or impossible-to-finger combinations. Annotate them.
     playable: list[tuple[list[int], list[Shape]]] = []
     unplayable_clusters: list[dict] = []
-    for cidx, (cluster, shapes) in enumerate(zip(clusters, cluster_shapes)):
+    for cidx, (cluster, shapes) in enumerate(zip(clusters, cluster_shapes, strict=True)):
         if shapes:
             playable.append((cluster, shapes))
         else:
@@ -162,11 +161,9 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
     cluster_id_of_note: dict[int, int] = {}
     cluster_records: list[dict] = []
     for cidx_out, ((cluster, shapes), shape, is_ambig) in enumerate(
-        zip(playable, chosen, ambiguous_flags)
+        zip(playable, chosen, ambiguous_flags, strict=True)
     ):
-        assignment_by_note = {
-            ni: (s, f) for ni, s, f in shape.assignments
-        }
+        assignment_by_note = {ni: (s, f) for ni, s, f in shape.assignments}
         for note_local_idx, note_global_idx in enumerate(cluster):
             cluster_id_of_note[note_global_idx] = cidx_out
             s, f = assignment_by_note[note_local_idx]
@@ -177,8 +174,8 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
                     "start": n["start"],
                     "end": n["end"],
                     "pitch": n["pitch"],
-                    "string": s,                # 0..5, 0 = low E
-                    "tab_string": NUM_STRINGS - s,   # 1..6, 1 = low E? — no, 6 = low E
+                    "string": s,  # 0..5, 0 = low E
+                    "tab_string": NUM_STRINGS - s,  # 1..6, 1 = low E? — no, 6 = low E
                     "fret": f,
                     "cluster_id": cidx_out,
                     "ambiguous": is_ambig,
@@ -393,7 +390,7 @@ def _flag_ambiguous(
     than full Viterbi cost because the latter includes transitions which
     are properties of the *path*, not of the cluster decision itself.)"""
     flags: list[bool] = []
-    for (_, shapes), pick in zip(playable, chosen):
+    for (_, shapes), pick in zip(playable, chosen, strict=True):
         # Find the second-best shape that differs from the chosen one in some
         # (string, fret) assignment (i.e., is a genuinely different choice).
         chosen_assigns = frozenset((s, f) for _, s, f in pick.assignments)
@@ -414,9 +411,7 @@ def _alternative_shapes(shapes: list[Shape], chosen: Shape, k: int = 3) -> list[
     """Return the top-k alternative shapes (excluding the chosen one)."""
     chosen_assigns = frozenset((s, f) for _, s, f in chosen.assignments)
     alts = [
-        sh
-        for sh in shapes
-        if frozenset((s, f) for _, s, f in sh.assignments) != chosen_assigns
+        sh for sh in shapes if frozenset((s, f) for _, s, f in sh.assignments) != chosen_assigns
     ]
     out = []
     for sh in alts[:k]:
@@ -424,9 +419,7 @@ def _alternative_shapes(shapes: list[Shape], chosen: Shape, k: int = 3) -> list[
             {
                 "cost": round(sh.cost, 4),
                 "delta_vs_chosen": round(sh.cost - chosen.cost, 4),
-                "assignments": [
-                    {"string": s, "fret": f} for _, s, f in sh.assignments
-                ],
+                "assignments": [{"string": s, "fret": f} for _, s, f in sh.assignments],
             }
         )
     return out

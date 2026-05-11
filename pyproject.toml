@@ -30,4 +30,27 @@ packages = ["src/migs_tab"]
 [dependency-groups]
 dev = [
     "ruff>=0.6",
+    "pre-commit>=3.7",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+# A pragmatic starter set — codestyle, pyflakes, isort, common bugbears,
+# and modern-Python upgrades. Tighten over time.
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length — ruff format owns this
+    "B008",  # function call in default argument (typer uses this idiomatically)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/migs_tab/cli.py" = ["B008"]
+

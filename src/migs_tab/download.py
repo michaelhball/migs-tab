@@ -127,7 +127,12 @@ def _vtt_to_plain_text(vtt_path: Path) -> str:
     prev = ""
     for raw in vtt_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw.strip()
-        if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
+        if (
+            not line
+            or line.startswith("WEBVTT")
+            or line.startswith("Kind:")
+            or line.startswith("Language:")
+        ):
             continue
         if "-->" in line or line.startswith("NOTE"):
             continue

@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, asdict
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import librosa
 import numpy as np
@@ -128,9 +128,7 @@ def analyze_structure(paths: VideoPaths, force: bool = False) -> VideoPaths:
     total_duration = float(len(y) / sr)
 
     raw_segments = _detect_playing_intervals(y, sr)
-    captions = (
-        _parse_vtt(paths.captions_vtt) if paths.captions_vtt.exists() else []
-    )
+    captions = _parse_vtt(paths.captions_vtt) if paths.captions_vtt.exists() else []
 
     templates = _build_chord_templates()
 
@@ -194,9 +192,7 @@ def _detect_playing_intervals(y: np.ndarray, sr: int) -> list[tuple[float, float
             merged.append([s, e])
 
     # Drop too-short spans (likely transients / talking with brief twangs).
-    return [
-        (s, e) for s, e in merged if (e - s) >= _MIN_SEGMENT_DURATION
-    ]
+    return [(s, e) for s, e in merged if (e - s) >= _MIN_SEGMENT_DURATION]
 
 
 # ---------------------------------------------------------------------------
@@ -290,9 +286,7 @@ def _smooth_chord_spans(spans: list[ChordSpan]) -> list[ChordSpan]:
 
     # Pass 1: drop tiny spans, attaching their time to whichever neighbor is longer.
     while True:
-        too_short = [
-            i for i, s in enumerate(spans) if (s.end - s.start) < _MIN_CHORD_DURATION
-        ]
+        too_short = [i for i, s in enumerate(spans) if (s.end - s.start) < _MIN_CHORD_DURATION]
         if not too_short:
             break
         i = too_short[0]

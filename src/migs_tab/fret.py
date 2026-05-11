@@ -38,6 +38,7 @@ from .paths import VideoPaths
 STANDARD_TUNING = (40, 45, 50, 55, 59, 64)
 NUM_STRINGS = 6
 MAX_FRET = 19  # most acoustic guitars have 19-22 accessible frets
+PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # Maximum reach a player can comfortably make with index → pinky.
 # 4 fret reach is comfortable; 5 is a stretch; 6+ is rare. We allow up to 5.
@@ -84,6 +85,56 @@ _AMBIGUITY_MARGIN = 0.12
 # _W_HAND_MOVE, so the algorithm will jump back to an open chord shape
 # even when it's currently anchored on a high-fret passage.
 _CHORD_SHAPE_BONUS = -4.0
+
+
+# Pitch classes (semitones mod 12, with C=0) for chord names produced by
+# structure.py. Used by the chord-context note filter to drop low-velocity
+# basic-pitch artifacts whose pitch doesn't fit the harmonic context.
+#
+# We accept any major/minor/dominant-seventh chord name "X", "Xm", "X7"
+# where X is a root in PITCH_NAMES. Pitch class is computed dynamically.
+def _chord_pitch_classes(chord_name: str) -> frozenset[int] | None:
+    """Map a chord name like 'Am', 'E7', 'F#' to the set of pitch classes
+    (0..11) that fit that chord. Returns None if we can't interpret it."""
+    if not chord_name:
+        return None
+    # Parse root and quality.
+    quality = ""
+    for suf in ("m7", "maj7", "m", "7"):
+        if chord_name.endswith(suf):
+            quality = suf
+            root_str = chord_name[: -len(suf)]
+            break
+    else:
+        root_str = chord_name
+    pitch_names_alt = {"Db": 1, "Eb": 3, "Gb": 6, "Ab": 8, "Bb": 10}
+    if root_str in pitch_names_alt:
+        root = pitch_names_alt[root_str]
+    else:
+        try:
+            root = PITCH_NAMES.index(root_str)
+        except ValueError:
+            return None
+    intervals = {
+        "": (0, 4, 7),  # major
+        "m": (0, 3, 7),  # minor
+        "7": (0, 4, 7, 10),  # dominant seventh
+        "m7": (0, 3, 7, 10),
+        "maj7": (0, 4, 7, 11),
+    }.get(quality, (0, 4, 7))
+    return frozenset((root + i) % 12 for i in intervals)
+
+
+# Velocity above which we KEEP an out-of-chord note (assume it's a melodic
+# passing tone or hammer-on the instructor played deliberately). Below this,
+# out-of-chord notes are treated as basic-pitch artifacts and dropped.
+_CHORD_FILTER_VELOCITY_FLOOR = 55
+
+# Toleration window for "near a chord tone": a pitch one semitone away from
+# a chord tone is treated as in-context (catches leading tones, chromatic
+# approach notes that show up in arpeggios).
+_CHORD_FILTER_NEIGHBOR_TOLERANCE = 1
+
 
 # Library of idiomatic open-position chord voicings keyed by chord name.
 # Each template maps pitch (MIDI) → (string_index, fret) under standard
@@ -185,6 +236,9 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         return paths
 
     notes = _dedupe_same_pitch_onsets(notes)
+    if paths.structure_json.exists():
+        chord_spans = _load_chord_spans(paths.structure_json)
+        notes = _filter_by_chord_context(notes, chord_spans)
     clusters = _cluster_notes_by_onset(notes)
     cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
 
@@ -261,6 +315,89 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
     }
     paths.frets_json.write_text(json.dumps(out, indent=2))
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Pre-clustering: chord-context note filter
+# ---------------------------------------------------------------------------
+
+
+def _load_chord_spans(structure_json_path) -> list[tuple[float, float, str]]:
+    """Flatten structure.json's per-segment chord spans into a single sorted
+    list of (start, end, chord_name) tuples."""
+    data = json.loads(structure_json_path.read_text())
+    spans: list[tuple[float, float, str]] = []
+    for seg in data.get("playing_segments", []):
+        for c in seg.get("chords", []):
+            spans.append((float(c["start"]), float(c["end"]), c["chord"]))
+    spans.sort(key=lambda x: x[0])
+    return spans
+
+
+def _chord_for_time(spans: list[tuple[float, float, str]], t: float) -> str | None:
+    """Linear search — fine since lookups are infrequent and spans are sorted.
+    Returns the chord name covering ``t`` or None if t is outside all spans."""
+    for s, e, name in spans:
+        if s <= t < e:
+            return name
+        if s > t:
+            return None
+    return None
+
+
+def _filter_by_chord_context(
+    notes: list[dict], chord_spans: list[tuple[float, float, str]]
+) -> list[dict]:
+    """Drop low-velocity notes whose pitch class is far from the local chord.
+
+    Rules:
+    - If a note falls in NO chord span (between playing segments), keep it
+      (likely instructor commentary, not part of a playing demo we'd render).
+    - If the chord at that time can be parsed, build its pitch-class set
+      plus a ±1-semitone tolerance band (catches passing tones).
+    - Drop notes whose pitch class is OUTSIDE that band AND whose velocity
+      is below ``_CHORD_FILTER_VELOCITY_FLOOR`` — likely basic-pitch artifacts.
+    - Keep loud out-of-chord notes (melodic passing tones, lead lines).
+    """
+    if not chord_spans:
+        return notes
+
+    # Pre-compute a chord-pitch-class cache so we don't reparse the same name.
+    cache: dict[str, frozenset[int] | None] = {}
+
+    def expanded_pcs(chord_name: str) -> frozenset[int] | None:
+        if chord_name in cache:
+            return cache[chord_name]
+        pcs = _chord_pitch_classes(chord_name)
+        if pcs is None:
+            cache[chord_name] = None
+            return None
+        expanded = set(pcs)
+        for pc in pcs:
+            for delta in range(1, _CHORD_FILTER_NEIGHBOR_TOLERANCE + 1):
+                expanded.add((pc + delta) % 12)
+                expanded.add((pc - delta) % 12)
+        result = frozenset(expanded)
+        cache[chord_name] = result
+        return result
+
+    out: list[dict] = []
+    for n in notes:
+        chord = _chord_for_time(chord_spans, n["start"])
+        if chord is None:
+            out.append(n)
+            continue
+        allowed = expanded_pcs(chord)
+        if allowed is None:
+            out.append(n)
+            continue
+        pc = n["pitch"] % 12
+        if pc in allowed:
+            out.append(n)
+            continue
+        if n.get("velocity", 0) >= _CHORD_FILTER_VELOCITY_FLOOR:
+            out.append(n)
+    return out
 
 
 # ---------------------------------------------------------------------------

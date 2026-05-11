@@ -15,6 +15,7 @@ import typer
 from rich.console import Console
 
 from . import download as download_mod
+from . import fret as fret_mod
 from . import separate as separate_mod
 from . import structure as structure_mod
 from . import transcribe as transcribe_mod
@@ -124,26 +125,42 @@ def structure(
 
 
 @app.command()
+def frets(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Assign string/fret positions to every note (Viterbi); write frets.json."""
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Assigning frets[/bold] for {paths.video_id}")
+    fret_mod.assign_frets(paths, force=force)
+    _print_status(paths)
+
+
+@app.command()
 def process(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
-    """Run the plumbing pipeline: download → separate → transcribe → structure."""
+    """Run the plumbing pipeline: download → separate → transcribe → structure → frets."""
     paths = _make_paths(url, cache_dir)
     console.rule(f"[bold cyan]migs-tab • {paths.video_id}")
 
-    console.print("[bold]1/4[/bold] download")
+    console.print("[bold]1/5[/bold] download")
     download_mod.download(url, paths, force=force)
 
-    console.print("[bold]2/4[/bold] separate (Demucs)")
+    console.print("[bold]2/5[/bold] separate (Demucs)")
     separate_mod.separate(paths, force=force)
 
-    console.print("[bold]3/4[/bold] transcribe (basic-pitch)")
+    console.print("[bold]3/5[/bold] transcribe (basic-pitch)")
     transcribe_mod.transcribe(paths, force=force)
 
-    console.print("[bold]4/4[/bold] structure (librosa)")
+    console.print("[bold]4/5[/bold] structure (librosa)")
     structure_mod.analyze_structure(paths, force=force)
+
+    console.print("[bold]5/5[/bold] frets (Viterbi)")
+    fret_mod.assign_frets(paths, force=force)
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)
@@ -169,6 +186,7 @@ def _print_status(paths: VideoPaths) -> None:
         ("notes.json", paths.notes_json),
         ("structure.json", paths.structure_json),
         ("sections.json", paths.sections_json),
+        ("frets.json", paths.frets_json),
         ("tips.md", paths.tips_md),
     ]
     console.print(f"\n[bold]Cache:[/bold] {paths.root}")

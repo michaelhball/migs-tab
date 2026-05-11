@@ -96,3 +96,11 @@ class VideoPaths:
     @property
     def sections_json(self) -> Path:
         return self.root / "sections.json"
+
+    @property
+    def frets_json(self) -> Path:
+        return self.root / "frets.json"
+
+    @property
+    def frames_dir(self) -> Path:
+        return self.root / "frames"

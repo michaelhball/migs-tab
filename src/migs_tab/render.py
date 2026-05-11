@@ -7,11 +7,11 @@ longest take), filters ``frets.json`` to that instance's time window,
 applies any ``frets.overrides.json`` corrections from the vision pass,
 and emits a 6-line ASCII tab grouped by section label.
 
-The output isn't beat-quantized — basic-pitch onsets are jittery and we
-don't have a reliable beat track yet — so the tab is *event-ordered*:
-each onset cluster becomes one column, with extra spacing inserted where
-the on-disk time gap exceeds a tunable threshold so the eye can see
-phrasing breaks.
+For each section we also run librosa beat tracking on the guitar stem
+slice corresponding to that section's canonical instance. Onset clusters
+are snapped to the nearest 8th-note subdivision so the tab columns align
+to beats — much easier to read than the event-ordered layout we had
+before, and gives an implicit feel for the song's rhythm.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+
+import librosa
+import numpy as np
 
 from .paths import DEFAULT_OUTPUT_DIR, VideoPaths
 
@@ -58,6 +61,13 @@ _DEMO_QUALITY_RANK = {
     "partial": 1,
 }
 
+# Beat-tracking + quantization parameters.
+_BEAT_SR = 22050
+_SUBDIVISIONS_PER_BEAT = 2  # 8th notes; bump to 4 for 16th-note quantization
+_BEATS_PER_BAR = 4  # most acoustic guitar tutorials are in 4/4
+# Fallback tempo to use when beat tracking fails / yields no beats.
+_FALLBACK_TEMPO_BPM = 90.0
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -74,6 +84,7 @@ class RenderedSection:
     cluster_count: int
     note_count: int
     ascii_tab: str
+    tempo_bpm: float
 
 
 def render(
@@ -117,7 +128,14 @@ def render(
         section_notes = [n for n in notes if canonical["start"] <= n["start"] < canonical["end"]]
         if not section_notes:
             continue
-        ascii_tab = _render_section_tab(section_notes, line_width=line_width)
+        tempo_bpm, beat_times = _detect_beats(
+            paths.guitar_stem, canonical["start"], canonical["end"]
+        )
+        ascii_tab = _render_section_tab(
+            section_notes,
+            line_width=line_width,
+            beat_times=beat_times,
+        )
         clusters_in_section = {n["cluster_id"] for n in section_notes}
         rendered.append(
             RenderedSection(
@@ -129,6 +147,7 @@ def render(
                 cluster_count=len(clusters_in_section),
                 note_count=len(section_notes),
                 ascii_tab=ascii_tab,
+                tempo_bpm=tempo_bpm,
             )
         )
 
@@ -136,6 +155,76 @@ def render(
     tab_path.write_text(tab_text)
     md_path.write_text(_format_markdown(sections_data, rendered))
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# Beat detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_beats(audio_path: Path, start_s: float, end_s: float) -> tuple[float, list[float]]:
+    """Run librosa beat tracking on the [start, end] slice of the guitar stem.
+
+    Returns (tempo_bpm, absolute beat times in the video's time frame).
+    Falls back to a uniform grid at ``_FALLBACK_TEMPO_BPM`` if librosa
+    finds no beats (very rare on guitar-stem audio).
+    """
+    if not audio_path.exists() or end_s <= start_s:
+        return _FALLBACK_TEMPO_BPM, _uniform_beat_grid(start_s, end_s, _FALLBACK_TEMPO_BPM)
+
+    duration = end_s - start_s
+    try:
+        y, sr = librosa.load(
+            str(audio_path), sr=_BEAT_SR, offset=start_s, duration=duration, mono=True
+        )
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        tempo_val = float(tempo) if np.isscalar(tempo) else float(tempo[0])
+        beat_times_rel = librosa.frames_to_time(beat_frames, sr=sr)
+        beat_times = [start_s + float(t) for t in beat_times_rel]
+    except Exception:
+        return _FALLBACK_TEMPO_BPM, _uniform_beat_grid(start_s, end_s, _FALLBACK_TEMPO_BPM)
+
+    if not beat_times:
+        return _FALLBACK_TEMPO_BPM, _uniform_beat_grid(start_s, end_s, _FALLBACK_TEMPO_BPM)
+
+    # Extend the grid to cover [start_s, end_s] using the detected period —
+    # librosa often misses the first beat or two and the trailing ones.
+    if len(beat_times) >= 2:
+        period = beat_times[1] - beat_times[0]
+    else:
+        period = 60.0 / tempo_val if tempo_val > 0 else 60.0 / _FALLBACK_TEMPO_BPM
+
+    extended: list[float] = list(beat_times)
+    t = beat_times[0] - period
+    while t > start_s - period / 2:
+        extended.insert(0, t)
+        t -= period
+    t = beat_times[-1] + period
+    while t < end_s + period / 2:
+        extended.append(t)
+        t += period
+    return tempo_val, extended
+
+
+def _uniform_beat_grid(start_s: float, end_s: float, bpm: float) -> list[float]:
+    period = 60.0 / bpm
+    return [start_s + i * period for i in range(int((end_s - start_s) / period) + 1)]
+
+
+def _subdivisions_from_beats(beat_times: list[float]) -> list[tuple[float, bool]]:
+    """Expand beat times into a list of (time, is_beat) at the chosen
+    subdivisions-per-beat granularity. is_beat=True marks downbeats."""
+    if len(beat_times) < 2:
+        return [(t, True) for t in beat_times]
+    grid: list[tuple[float, bool]] = []
+    for i in range(len(beat_times) - 1):
+        beat_start = beat_times[i]
+        beat_end = beat_times[i + 1]
+        step = (beat_end - beat_start) / _SUBDIVISIONS_PER_BEAT
+        for j in range(_SUBDIVISIONS_PER_BEAT):
+            grid.append((beat_start + j * step, j == 0))
+    grid.append((beat_times[-1], True))
+    return grid
 
 
 # ---------------------------------------------------------------------------
@@ -251,41 +340,126 @@ def _pick_canonical_instance(section: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _render_section_tab(section_notes: list[dict], line_width: int) -> str:
-    """Render section's notes as a wrapped 6-line ASCII tab."""
-    # Group notes into onset clusters (cluster_id from frets.json).
+def _render_section_tab(
+    section_notes: list[dict],
+    line_width: int,
+    beat_times: list[float],
+) -> str:
+    """Render section's notes as a beat-aligned 6-line ASCII tab.
+
+    The visible columns correspond to 8th-note subdivisions of the
+    detected beat grid. Cluster onsets are snapped to the nearest
+    subdivision. Beat downbeats are marked with a wider separator;
+    every ``_BEATS_PER_BAR`` beats a bar line `|` is drawn.
+    """
+    if not section_notes:
+        return ""
+
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for n in section_notes:
         by_cluster[n["cluster_id"]].append(n)
     cluster_ids = sorted(by_cluster, key=lambda cid: min(n["start"] for n in by_cluster[cid]))
 
-    if not cluster_ids:
-        return ""
+    grid = _subdivisions_from_beats(beat_times)
+    if not grid:
+        # Beat detection produced nothing usable — fall back to event-ordered.
+        return _render_event_ordered(by_cluster, cluster_ids, line_width)
 
-    # Build raw columns. Each column is a tuple (cell_strings, separator_width).
+    # Map each cluster to its nearest grid slot.
+    grid_times = [t for t, _ in grid]
+    cluster_at_slot: dict[int, list[dict]] = defaultdict(list)
+    for cid in cluster_ids:
+        t = min(n["start"] for n in by_cluster[cid])
+        slot = _nearest_index(grid_times, t)
+        cluster_at_slot[slot].extend(by_cluster[cid])
+
+    # Build a cell per grid slot (most are empty rests).
+    raw_cells: list[list[str]] = []
+    slot_markers: list[str] = []  # "" / "beat" / "bar"
+    beat_count = 0
+    for slot_idx, (_, is_beat) in enumerate(grid):
+        cell = ["-"] * 6
+        notes_here = cluster_at_slot.get(slot_idx, [])
+        for n in notes_here:
+            line_idx = 5 - n["string"]
+            cell[line_idx] = str(n["fret"])
+        cell_width = max(len(c) for c in cell)
+        cell = [c.rjust(cell_width, "-") for c in cell]
+        raw_cells.append(cell)
+        if is_beat:
+            beat_count += 1
+            slot_markers.append("bar" if beat_count % _BEATS_PER_BAR == 1 else "beat")
+        else:
+            slot_markers.append("")
+
+    return _pack_quantized(raw_cells, slot_markers, line_width)
+
+
+def _render_event_ordered(
+    by_cluster: dict[int, list[dict]],
+    cluster_ids: list[int],
+    line_width: int,
+) -> str:
+    """Fallback when beat detection fails — old per-onset rendering."""
     raw_cells: list[list[str]] = []
     prev_end: float | None = None
     for cid in cluster_ids:
         cluster_notes = by_cluster[cid]
         cluster_start = min(n["start"] for n in cluster_notes)
         cluster_end = max(n.get("end", n["start"]) for n in cluster_notes)
-
-        # Insert a "pause" cell if the gap to the previous cluster is large.
         if prev_end is not None and cluster_start - prev_end > _PAUSE_GAP_SECONDS:
             raw_cells.append(_pause_cell())
-
         cell = ["-"] * 6
         for n in cluster_notes:
-            line_idx = 5 - n["string"]  # tab top line = high E (string 5)
+            line_idx = 5 - n["string"]
             cell[line_idx] = str(n["fret"])
-        # Pad each line in the cell to the same width.
         cell_width = max(len(c) for c in cell)
         cell = [c.rjust(cell_width, "-") for c in cell]
         raw_cells.append(cell)
         prev_end = cluster_end
-
-    # Pack cells into systems of width ~ line_width.
     return _pack_into_systems(raw_cells, line_width)
+
+
+def _nearest_index(sorted_times: list[float], t: float) -> int:
+    """Bisect to find the closest index in a sorted list of times."""
+    import bisect
+
+    i = bisect.bisect_left(sorted_times, t)
+    if i == 0:
+        return 0
+    if i >= len(sorted_times):
+        return len(sorted_times) - 1
+    before = sorted_times[i - 1]
+    after = sorted_times[i]
+    return i - 1 if abs(t - before) <= abs(t - after) else i
+
+
+def _pack_quantized(cells: list[list[str]], markers: list[str], line_width: int) -> str:
+    """Pack beat-quantized cells into systems, drawing bar lines and a
+    slightly-wider separator at beats."""
+    if not cells:
+        return ""
+    systems: list[list[str]] = []
+    current = ["" for _ in range(6)]
+    for cell, marker in zip(cells, markers, strict=True):
+        cell_width = len(cell[0])
+        sep = "|" if marker == "bar" else "-"
+        added = cell_width + 1
+        if current[0] and len(current[0]) + added > line_width - 4:
+            systems.append(current)
+            current = ["" for _ in range(6)]
+        for i in range(6):
+            current[i] += cell[i] + sep
+    if current[0]:
+        systems.append(current)
+
+    parts: list[str] = []
+    for sys_lines in systems:
+        block = []
+        for letter, line in zip(_TAB_STRING_LETTERS, sys_lines, strict=True):
+            block.append(f"  {letter}|-{line}")
+        parts.append("\n".join(block))
+    return "\n\n".join(parts)
 
 
 def _pause_cell() -> list[str]:
@@ -340,7 +514,8 @@ def _format_full_tab(sections_data: dict, rendered: list[RenderedSection]) -> st
         lines.append("=" * 72)
         lines.append(
             f"[{sec.label}]   {sec.canonical_start:.1f}-{sec.canonical_end:.1f}s "
-            f"({sec.note_count} notes, {sec.cluster_count} clusters)"
+            f"({sec.note_count} notes, {sec.cluster_count} clusters, "
+            f"~{sec.tempo_bpm:.0f} bpm)"
         )
         if sec.chord_progression:
             lines.append(f"chords: {'  '.join(sec.chord_progression[:16])}")
@@ -366,7 +541,8 @@ def _format_markdown(sections_data: dict, rendered: list[RenderedSection]) -> st
         parts.append(f"## {sec.label}")
         parts.append(
             f"_{sec.canonical_start:.1f}-{sec.canonical_end:.1f}s · "
-            f"{sec.note_count} notes · chords: {' '.join(sec.chord_progression[:16])}_\n"
+            f"{sec.note_count} notes · ~{sec.tempo_bpm:.0f} bpm · "
+            f"chords: {' '.join(sec.chord_progression[:16])}_\n"
         )
         if sec.description:
             parts.append(sec.description + "\n")

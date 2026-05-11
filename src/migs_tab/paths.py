@@ -88,3 +88,11 @@ class VideoPaths:
     @property
     def tips_md(self) -> Path:
         return self.root / "tips.md"
+
+    @property
+    def structure_json(self) -> Path:
+        return self.root / "structure.json"
+
+    @property
+    def sections_json(self) -> Path:
+        return self.root / "sections.json"

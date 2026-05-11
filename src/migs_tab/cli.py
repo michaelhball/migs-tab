@@ -16,6 +16,7 @@ from rich.console import Console
 
 from . import download as download_mod
 from . import separate as separate_mod
+from . import structure as structure_mod
 from . import transcribe as transcribe_mod
 from .paths import DEFAULT_CACHE_DIR, VideoPaths, extract_video_id
 
@@ -110,23 +111,39 @@ def transcribe(
 
 
 @app.command()
+def structure(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Analyze playing segments + chord progressions; write structure.json."""
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Analyzing structure[/bold] for {paths.video_id}")
+    structure_mod.analyze_structure(paths, force=force)
+    _print_status(paths)
+
+
+@app.command()
 def process(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
     force: bool = typer.Option(False, "--force"),
 ) -> None:
-    """Run the plumbing pipeline: download → separate → transcribe."""
+    """Run the plumbing pipeline: download → separate → transcribe → structure."""
     paths = _make_paths(url, cache_dir)
     console.rule(f"[bold cyan]migs-tab • {paths.video_id}")
 
-    console.print("[bold]1/3[/bold] download")
+    console.print("[bold]1/4[/bold] download")
     download_mod.download(url, paths, force=force)
 
-    console.print("[bold]2/3[/bold] separate (Demucs)")
+    console.print("[bold]2/4[/bold] separate (Demucs)")
     separate_mod.separate(paths, force=force)
 
-    console.print("[bold]3/3[/bold] transcribe (basic-pitch)")
+    console.print("[bold]3/4[/bold] transcribe (basic-pitch)")
     transcribe_mod.transcribe(paths, force=force)
+
+    console.print("[bold]4/4[/bold] structure (librosa)")
+    structure_mod.analyze_structure(paths, force=force)
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)
@@ -150,6 +167,8 @@ def _print_status(paths: VideoPaths) -> None:
         ("guitar stem", paths.guitar_stem),
         ("notes.mid", paths.notes_midi),
         ("notes.json", paths.notes_json),
+        ("structure.json", paths.structure_json),
+        ("sections.json", paths.sections_json),
         ("tips.md", paths.tips_md),
     ]
     console.print(f"\n[bold]Cache:[/bold] {paths.root}")

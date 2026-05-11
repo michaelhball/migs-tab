@@ -63,7 +63,11 @@ _W_OPEN_BONUS = -0.8  # per open string in the shape (strong reward)
 _W_HIGH_FRET_PENALTY = 0.4  # extra penalty above fret 12
 
 # Weights for the transition cost between consecutive clusters.
-_W_HAND_MOVE = 0.35  # change in average fret position (light)
+# Lighter than the initial 0.35: the chord prior now does most of the
+# anchoring, and hand-move shouldn't be strong enough to trap the path
+# in a high-fret position when the next cluster has an obvious open-chord
+# match.
+_W_HAND_MOVE = 0.15
 _W_STRING_PRESERVE = -0.15  # bonus per note still on the same string
 
 # An assignment is "ambiguous" if the runner-up shape was within this delta.
@@ -71,6 +75,53 @@ _W_STRING_PRESERVE = -0.15  # bonus per note still on the same string
 # only the genuinely close calls (a single fret/string disagreement at
 # similar position cost).
 _AMBIGUITY_MARGIN = 0.12
+
+# Idiomatic chord-shape bonus: when a cluster's pitches form a subset of a
+# known open-position chord template AND the candidate shape's (string, fret)
+# choices exactly match the template's voicing for those pitches, apply this
+# negative cost. Scaled by coverage (full chord = full bonus, 1-of-5 = 20%).
+# Large enough to overcome ~5-7 frets of hand movement at the current
+# _W_HAND_MOVE, so the algorithm will jump back to an open chord shape
+# even when it's currently anchored on a high-fret passage.
+_CHORD_SHAPE_BONUS = -4.0
+
+# Library of idiomatic open-position chord voicings keyed by chord name.
+# Each template maps pitch (MIDI) → (string_index, fret) under standard
+# tuning (low E = string 0). These are the cowboy chord shapes a guitarist
+# defaults to when notes are in range; the algorithm should strongly
+# prefer these voicings over arbitrary high-fret alternatives.
+#
+# String index reminder: 0=low E (E2 open), 1=A, 2=D, 3=G, 4=B, 5=high E (E4 open).
+_CHORD_TEMPLATES: dict[str, dict[int, tuple[int, int]]] = {
+    # E minor — open
+    "Em": {40: (0, 0), 47: (1, 2), 52: (2, 2), 55: (3, 0), 59: (4, 0), 64: (5, 0)},
+    # E major — open
+    "E": {40: (0, 0), 47: (1, 2), 52: (2, 2), 56: (3, 1), 59: (4, 0), 64: (5, 0)},
+    # E7 — open (D string open in middle)
+    "E7": {40: (0, 0), 47: (1, 2), 50: (2, 0), 56: (3, 1), 59: (4, 0), 64: (5, 0)},
+    # A minor — open
+    "Am": {45: (1, 0), 52: (2, 2), 57: (3, 2), 60: (4, 1), 64: (5, 0)},
+    # A major — open
+    "A": {45: (1, 0), 52: (2, 2), 57: (3, 2), 61: (4, 2), 64: (5, 0)},
+    # A7 — open (D fret 2, G open, B fret 2, high E open)
+    "A7": {45: (1, 0), 52: (2, 2), 55: (3, 0), 61: (4, 2), 64: (5, 0)},
+    # D major — open
+    "D": {50: (2, 0), 57: (3, 2), 62: (4, 3), 66: (5, 2)},
+    # D minor — open
+    "Dm": {50: (2, 0), 57: (3, 2), 62: (4, 3), 65: (5, 1)},
+    # D7 — open
+    "D7": {50: (2, 0), 57: (3, 2), 60: (4, 1), 66: (5, 2)},
+    # G major — open (the classic 3-2-0-0-0-3 voicing)
+    "G": {43: (0, 3), 47: (1, 2), 50: (2, 0), 55: (3, 0), 59: (4, 0), 67: (5, 3)},
+    # G major — alternative (3-2-0-0-3-3 with high B fret 3)
+    "G_alt": {43: (0, 3), 47: (1, 2), 50: (2, 0), 55: (3, 0), 62: (4, 3), 67: (5, 3)},
+    # C major — open
+    "C": {48: (1, 3), 52: (2, 2), 55: (3, 0), 60: (4, 1), 64: (5, 0)},
+    # F major — small "partial F" (top four strings): D fret 3, G fret 2, B fret 1, high E fret 1
+    "F_partial": {53: (2, 3), 57: (3, 2), 60: (4, 1), 65: (5, 1)},
+    # B minor — barre at fret 2 (common in folk/rock arrangements)
+    "Bm": {47: (1, 2), 54: (2, 4), 59: (3, 4), 62: (4, 3), 66: (5, 2)},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +184,7 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         paths.frets_json.write_text(json.dumps({"note_count": 0, "notes": []}, indent=2))
         return paths
 
+    notes = _dedupe_same_pitch_onsets(notes)
     clusters = _cluster_notes_by_onset(notes)
     cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
 
@@ -212,6 +264,42 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
 
 
 # ---------------------------------------------------------------------------
+# Pre-clustering: dedupe near-duplicate same-pitch onsets
+# ---------------------------------------------------------------------------
+
+# Window (seconds) within which two same-pitch detections are treated as a
+# single note. basic-pitch occasionally splits one struck note into two
+# overlapping detections; including both in a cluster forces them onto
+# different strings and breaks chord-template matching.
+_SAME_PITCH_DEDUPE_WINDOW = 0.20
+
+
+def _dedupe_same_pitch_onsets(notes: list[dict]) -> list[dict]:
+    """Drop duplicate onsets where another note of the same pitch starts within
+    ``_SAME_PITCH_DEDUPE_WINDOW`` and the surviving copy is louder/longer."""
+    by_pitch_sorted = sorted(notes, key=lambda n: (n["pitch"], n["start"]))
+    survivors: list[dict] = []
+    last_by_pitch: dict[int, dict] = {}
+    for n in by_pitch_sorted:
+        prev = last_by_pitch.get(n["pitch"])
+        if prev is not None and n["start"] - prev["start"] <= _SAME_PITCH_DEDUPE_WINDOW:
+            prev_score = (prev.get("velocity", 0), prev["end"] - prev["start"])
+            this_score = (n.get("velocity", 0), n["end"] - n["start"])
+            if this_score > prev_score:
+                # Replace the previously-kept copy with this stronger one.
+                for i, existing in enumerate(survivors):
+                    if existing is prev:
+                        survivors[i] = n
+                        break
+                last_by_pitch[n["pitch"]] = n
+            continue
+        survivors.append(n)
+        last_by_pitch[n["pitch"]] = n
+    survivors.sort(key=lambda n: (n["start"], n["pitch"]))
+    return survivors
+
+
+# ---------------------------------------------------------------------------
 # Cluster notes by onset
 # ---------------------------------------------------------------------------
 
@@ -270,6 +358,9 @@ def _enumerate_shapes(notes: list[dict], cluster: list[int]) -> list[Shape]:
     if any(not o for o in per_note_options):
         return []
 
+    pitches = [notes[i]["pitch"] for i in cluster]
+    pitch_set = frozenset(pitches)
+
     shapes: list[Shape] = []
     # Cartesian product of options. Bounded since cluster sizes are small
     # (typically 1-6 notes for a chord).
@@ -283,12 +374,42 @@ def _enumerate_shapes(notes: list[dict], cluster: list[int]) -> list[Shape]:
             if span > MAX_HAND_SPAN:
                 continue
         assignments = tuple((i, s, f) for i, (s, f) in enumerate(combo))
-        cost = _intrinsic_cost(combo)
+        cost = _intrinsic_cost(combo) + _chord_shape_bonus(pitches, combo, pitch_set)
         shapes.append(Shape(assignments, cost))
 
     # Limit to the K best shapes per cluster to keep Viterbi tractable.
     shapes.sort(key=lambda x: x.cost)
     return shapes[:32]
+
+
+def _chord_shape_bonus(
+    pitches: list[int],
+    combo: tuple[tuple[int, int], ...],
+    pitch_set: frozenset[int],
+) -> float:
+    """Negative-cost bonus if this shape exactly matches a known chord
+    template's voicing for the cluster's pitches.
+
+    A template "applies" when the cluster's pitches are a subset of the
+    template's notes AND the candidate shape places every note on the
+    template-specified string/fret. Scaled by coverage so a full Am
+    cluster gets the full bonus and a 2-of-5 partial gets ~40%.
+    """
+    if len(pitches) == 0:
+        return 0.0
+    best_bonus = 0.0
+    for template in _CHORD_TEMPLATES.values():
+        if not pitch_set <= template.keys():
+            continue
+        # Does this combo place every pitch where the template wants it?
+        matches = all(template[pitches[i]] == (s, f) for i, (s, f) in enumerate(combo))
+        if not matches:
+            continue
+        coverage = len(pitch_set) / len(template)
+        bonus = _CHORD_SHAPE_BONUS * coverage
+        if bonus < best_bonus:
+            best_bonus = bonus
+    return best_bonus
 
 
 def _intrinsic_cost(combo: tuple[tuple[int, int], ...]) -> float:

@@ -29,6 +29,7 @@ Equivalent to running `download`, `separate`, `transcribe`, and `structure` in s
 - `stems/other.wav` — guitar-isolated stem (Demucs)
 - `notes.mid`, `notes.json` — polyphonic note events (basic-pitch)
 - `structure.json` — playing segments + per-segment chord progressions + per-segment captions (librosa)
+- `frets.json` — heuristic (string, fret) per note + ambiguous flag + alternatives per cluster (Viterbi)
 
 Notes:
 - Demucs on a long video takes minutes on CPU. Be patient and let it finish.
@@ -145,11 +146,79 @@ After Step 3, print a final summary:
 
 Do not dump the raw caption transcript, notes.json, or structure.json content.
 
-## Phase 3-4 (not yet implemented)
+### Step 4 — Fret optimization (Python heuristic, already done in plumbing)
 
-When the user asks for these, tell them they're future work:
-- Phase 3: heuristic + vision-pass fret optimization, picking exact fret/string positions per note.
-- Phase 4: ASCII tab + MusicXML rendering using the grouped instances from sections.json for redundancy.
+`uv run migs-tab process` already runs the heuristic Viterbi over notes.json
+and produces `cache/<id>/frets.json`, containing one (string, fret) per note
+plus an `ambiguous` flag per cluster and a list of `alternatives`. You don't
+need to do anything here unless the user asks you to re-tune the weights.
+
+### Step 5 — Vision pass on ambiguous fret assignments (you do this — bounded)
+
+**IMPORTANT — quota guardrail:** Each vision-pass frame is a Read on a JPEG,
+which costs Claude tokens. Never extract more than the user is willing to pay
+for. The default ceiling is **5 frames per pass** and **at most one pass per
+song section** unless the user explicitly asks for a wider sweep. The CLI
+enforces this via `--max-frames` (default 10, but for routine use prefer 3-5).
+
+Workflow:
+
+1. **Pick a tiny, high-value subset of ambiguous clusters.** Don't iterate over
+   all clusters in frets.json — there are typically hundreds. Prefer:
+   - Clusters where the *intrinsic-cost delta* between chosen and alternative
+     is very small (near-tie cases where vision will make the biggest impact).
+   - Clusters in canonical-reference segments from sections.json (a single
+     correction on the slow intro replay propagates structurally across the
+     other intro instances).
+   - A few clusters spread across the song so we sample different hand
+     positions rather than re-confirming the same passage.
+
+2. **Extract frames** (CLI does this; clamps to max_frames):
+   ```bash
+   uv run migs-tab frames-for-clusters <url> <comma-separated-ids> \
+       --max-frames 5 --subdir <descriptive_name>
+   ```
+   Writes `cache/<id>/frames/<subdir>/t<seconds>_cluster<id>.jpg`.
+
+3. **Read each frame with the Read tool.** For each frame:
+   - Identify which fret region the visible hand is in. The dot inlays on the
+     fretboard are reliable anchors: single dots at frets 3, 5, 7, 9, then a
+     double dot at fret 12 (on most acoustics).
+   - Decide whether the algorithm's chosen (string, fret) is consistent with
+     the visible hand position, or whether one of the listed `alternatives`
+     fits better.
+   - If the hand is mid-transition (no fingers pressed), abstain — do not
+     override the algorithm. Note this in your output.
+
+4. **Write `cache/<id>/frets.overrides.json`** with the corrections:
+   ```json
+   {
+     "video_id": "<id>",
+     "overrides": [
+       {
+         "cluster_id": 1813,
+         "reason": "Hand clearly at fret 7 — algorithm picked fret 17.",
+         "new_assignments": [{"note_index": 0, "string": 3, "fret": 7}]
+       }
+     ],
+     "unchanged_after_review": [1838],
+     "abstained": [{"cluster_id": 1900, "reason": "Hand mid-transition, no fingers pressed."}]
+   }
+   ```
+
+5. **Print to the user**: how many frames reviewed, how many corrections, a
+   one-line description of each correction. Do not show the frames themselves.
+
+**Do NOT** sweep ambiguous clusters across the full song without the user's
+explicit go-ahead. Default behavior is conservative — review a small, targeted
+batch and report.
+
+## Phase 4 (not yet implemented)
+
+When the user asks for it, tell them it's future work:
+- Phase 4: ASCII tab + MusicXML rendering. Uses sections.json to organize the
+  tab by song role, drawing notes from the longest/cleanest instance of each
+  section and applying `frets.json` + `frets.overrides.json` for fret choices.
 
 See `SPEC.md` for the full design.
 
@@ -161,6 +230,7 @@ See `SPEC.md` for the full design.
 - **The wrong stem is captured** — if the "other" stem doesn't sound like the guitar (e.g., backing track has prominent piano), try `--model htdemucs_ft` (slower, fine-tuned) and rerun separate with `--force`.
 - **Chord progressions look like nonsense** — the detector struggles when the instructor is mostly arpeggiating single notes with no clear chord context. Trust captions more than chord progression in these segments.
 - **Way too many playing segments (or way too few)** — sensitivity is set by `top_db` in `structure.py`. Re-run with `--force` after adjusting if needed.
+- **Vision pass returns ambiguous answers** — many tutorial frames catch the hand mid-transition with no fingers pressed; abstain rather than guess. If multiple frames around a cluster all look mid-transition, try extracting at onset - 0.1s by using `migs-tab frame <url> <onset_minus_0.1>` manually.
 
 ## Conventions
 

@@ -86,6 +86,13 @@ _AMBIGUITY_MARGIN = 0.12
 # even when it's currently anchored on a high-fret passage.
 _CHORD_SHAPE_BONUS = -4.0
 
+# Per-note chord-context bias: applied PER NOTE during shape enumeration
+# when the active chord (from structure.json) has a known template and the
+# candidate shape places that pitch on the template-prescribed string/fret.
+# Smaller than the full-shape bonus because it fires for partial matches
+# too (e.g., a single arpeggiated A3 during an Am section).
+_CHORD_CONTEXT_PER_NOTE_BONUS = -1.2
+
 
 # Pitch classes (semitones mod 12, with C=0) for chord names produced by
 # structure.py. Used by the chord-context note filter to drop low-velocity
@@ -236,11 +243,12 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         return paths
 
     notes = _dedupe_same_pitch_onsets(notes)
+    chord_spans: list[tuple[float, float, str]] = []
     if paths.structure_json.exists():
         chord_spans = _load_chord_spans(paths.structure_json)
         notes = _filter_by_chord_context(notes, chord_spans)
     clusters = _cluster_notes_by_onset(notes)
-    cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
+    cluster_shapes = [_enumerate_shapes(notes, c, chord_spans) for c in clusters]
 
     # Drop clusters where no playable shape exists — these are pitches
     # outside guitar range or impossible-to-finger combinations. Annotate them.
@@ -472,7 +480,11 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
-def _enumerate_shapes(notes: list[dict], cluster: list[int]) -> list[Shape]:
+def _enumerate_shapes(
+    notes: list[dict],
+    cluster: list[int],
+    chord_spans: list[tuple[float, float, str]],
+) -> list[Shape]:
     """Enumerate all playable (string, fret) assignments for one cluster.
 
     Each note must go on a distinct string; the fretted frets (excluding
@@ -497,6 +509,9 @@ def _enumerate_shapes(notes: list[dict], cluster: list[int]) -> list[Shape]:
 
     pitches = [notes[i]["pitch"] for i in cluster]
     pitch_set = frozenset(pitches)
+    cluster_start = min(notes[i]["start"] for i in cluster)
+    context_chord = _chord_for_time(chord_spans, cluster_start) if chord_spans else None
+    context_template = _CHORD_TEMPLATES.get(context_chord) if context_chord else None
 
     shapes: list[Shape] = []
     # Cartesian product of options. Bounded since cluster sizes are small
@@ -511,12 +526,45 @@ def _enumerate_shapes(notes: list[dict], cluster: list[int]) -> list[Shape]:
             if span > MAX_HAND_SPAN:
                 continue
         assignments = tuple((i, s, f) for i, (s, f) in enumerate(combo))
-        cost = _intrinsic_cost(combo) + _chord_shape_bonus(pitches, combo, pitch_set)
+        cost = (
+            _intrinsic_cost(combo)
+            + _chord_shape_bonus(pitches, combo, pitch_set)
+            + _chord_context_bias(pitches, combo, context_template)
+        )
         shapes.append(Shape(assignments, cost))
 
     # Limit to the K best shapes per cluster to keep Viterbi tractable.
     shapes.sort(key=lambda x: x.cost)
     return shapes[:32]
+
+
+def _chord_context_bias(
+    pitches: list[int],
+    combo: tuple[tuple[int, int], ...],
+    context_template: dict[int, tuple[int, int]] | None,
+) -> float:
+    """Per-note bonus when the active chord's template prescribes a string/fret
+    for this pitch and the candidate combo matches it.
+
+    Unlike ``_chord_shape_bonus`` (which requires the *cluster* to be a
+    subset of a template), this bias fires even for single-note clusters —
+    so a lone A3 picked during an Am section gets pulled to G fret 2 because
+    Am's template says so.
+
+    Scaled per-note (smaller than the full-cluster bonus) so it nudges but
+    doesn't override compactness or hand-coherence when the candidate is
+    genuinely out of context.
+    """
+    if context_template is None:
+        return 0.0
+    bonus = 0.0
+    for i, (s, f) in enumerate(combo):
+        target = context_template.get(pitches[i])
+        if target is None:
+            continue
+        if target == (s, f):
+            bonus += _CHORD_CONTEXT_PER_NOTE_BONUS
+    return bonus
 
 
 def _chord_shape_bonus(

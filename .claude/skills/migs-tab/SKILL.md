@@ -213,14 +213,45 @@ Workflow:
 explicit go-ahead. Default behavior is conservative — review a small, targeted
 batch and report.
 
-## Phase 4 (not yet implemented)
+### Step 6 — Render the tab (Python, fast)
 
-When the user asks for it, tell them it's future work:
-- Phase 4: ASCII tab + MusicXML rendering. Uses sections.json to organize the
-  tab by song role, drawing notes from the longest/cleanest instance of each
-  section and applying `frets.json` + `frets.overrides.json` for fret choices.
+```bash
+uv run migs-tab render <url>
+```
 
-See `SPEC.md` for the full design.
+Reads `sections.json` + `frets.json` + (optional) `frets.overrides.json`,
+picks the canonical instance of each section (slow-walkthrough > normal-
+tempo > longest), filters transient/quiet/duplicate notes, and writes:
+
+- `output/<id>/tab.txt` — ASCII tab with section headers
+- `output/<id>/tab.md` — markdown wrapper with the structural summary
+
+Section order in the rendered tab follows `sections.json` (typically the
+tutorial's teaching order, which is generally a sensible play-through
+order for learning).
+
+### Step 7 — Final summary (you do this)
+
+After Phase 4 print:
+- Where each output file lives (`cache/<id>/tips.md`, `output/<id>/tab.txt`,
+  `output/<id>/tab.md`)
+- Section count rendered + a one-line example from a section
+- Any major caveats — e.g., if `frets.json` had >50% ambiguous clusters and
+  the user hasn't run a vision pass yet, surface that.
+
+## Known limitations to surface honestly when asked
+
+- The ASCII tab is *event-ordered*, not beat-quantized. Each onset is a
+  column; phrasing gaps trigger extra spacing. We don't have a reliable beat
+  track yet.
+- basic-pitch over-detects (sympathetic resonance, transients). The filter
+  in `render.py` is conservative; some noise gets through.
+- The heuristic Viterbi for fret assignment doesn't model idiomatic chord
+  shapes (open Am, open G, etc.) explicitly — it scores compactness +
+  open-string bonus. The vision pass is the intended way to fix the
+  occasional fret-17 instead of fret-7 mistake.
+- MusicXML export for Guitar Pro / MuseScore is on the future-work list but
+  not yet implemented.
 
 ## Failure modes you should handle
 

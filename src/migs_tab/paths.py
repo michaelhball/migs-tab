@@ -10,6 +10,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "cache"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 
+__all__ = [
+    "DEFAULT_CACHE_DIR",
+    "DEFAULT_OUTPUT_DIR",
+    "PROJECT_ROOT",
+    "VideoPaths",
+    "extract_video_id",
+]
+
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -104,3 +112,12 @@ class VideoPaths:
     @property
     def frames_dir(self) -> Path:
         return self.root / "frames"
+
+    @property
+    def frets_overrides_json(self) -> Path:
+        return self.root / "frets.overrides.json"
+
+    def output_dir(self, output_root: Path) -> Path:
+        d = output_root / self.video_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d

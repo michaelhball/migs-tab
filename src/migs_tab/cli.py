@@ -17,10 +17,11 @@ from rich.console import Console
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
+from . import render as render_mod
 from . import separate as separate_mod
 from . import structure as structure_mod
 from . import transcribe as transcribe_mod
-from .paths import DEFAULT_CACHE_DIR, VideoPaths, extract_video_id
+from .paths import DEFAULT_CACHE_DIR, DEFAULT_OUTPUT_DIR, VideoPaths, extract_video_id
 
 app = typer.Typer(
     help="Convert YouTube acoustic guitar tutorials into accurate tabs (plumbing layer).",
@@ -185,6 +186,20 @@ def frames_for_clusters(
             f"  cluster {rec['cluster_id']:>4}  onset {rec.get('onset', '?'):>7.2f}s  "
             f"→ {rec.get('frame_path', '<error>')}"
         )
+
+
+@app.command()
+def render(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    output_dir: Path = typer.Option(DEFAULT_OUTPUT_DIR, "--output-dir"),
+    line_width: int = typer.Option(72, "--line-width"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Render the section-by-section ASCII tab to output/<id>/tab.txt + tab.md."""
+    paths = _make_paths(url, cache_dir)
+    out = render_mod.render(paths, output_root=output_dir, line_width=line_width, force=force)
+    console.print(f"[green]✓[/green] {out}")
 
 
 @app.command()

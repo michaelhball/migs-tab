@@ -213,6 +213,57 @@ Workflow:
 explicit go-ahead. Default behavior is conservative — review a small, targeted
 batch and report.
 
+### Step 5.5 — Chord-shape verification (you do this, optional but recommended)
+
+If `cache/<id>/chord-shape-candidates.json` doesn't exist yet, run:
+
+```bash
+uv run migs-tab chord-shape-frames <url>
+```
+
+This picks one representative frame per distinct chord in the progression
+(the longest span's 25%-mark timestamp) and writes them under
+`cache/<id>/frames/chord-shapes/<chord>.jpg`. Typical output: 10-20 frames.
+
+For each chord, read its frame with the Read tool and answer:
+- Is the player's fretting hand visible and fully placed?
+- What (string, fret) positions are pressed?
+- Does this match the algorithm's chord template for that chord?
+
+Output to `cache/<id>/chord-shapes-verified.json`:
+```json
+{
+  "video_id": "<id>",
+  "verified": {
+    "Am": {
+      "frame_used": "primary",
+      "voicing": [{"string": 1, "fret": 0}, {"string": 2, "fret": 2}, ...],
+      "voicing_name": "cowboy Am (open)",
+      "matches_default_template": true,
+      "notes": "Clear open Am voicing — confirmed."
+    },
+    "E7": {
+      "frame_used": "primary",
+      "voicing": [{"string": 0, "fret": 0}, ...],
+      "voicing_name": "Angie 'money' E7 voicing",
+      "matches_default_template": false,
+      "notes": "Player uses the non-standard E7 voicing the instructor calls the 'money chord' — different from the default E7 template."
+    }
+  },
+  "abstained": [
+    {"chord": "Am", "frame": "primary", "reason": "Hand mid-strum at fret 12 — high-position Am during 'Angie' line, not cowboy Am. Try one of the alternates."}
+  ]
+}
+```
+
+If the primary frame catches the hand mid-transition or at an unusual
+voicing, try a frame from one of the `alternates` (each lists a different
+timestamp). If no available frame shows a clear cowboy fingering, abstain
+for that chord.
+
+**Quota guardrail:** at most one verification pass per song. 10-20 frames
+of vision input ≈ 15-30k input tokens — typically fine on a Pro plan.
+
 ### Step 6 — Render the tab (Python, fast)
 
 ```bash

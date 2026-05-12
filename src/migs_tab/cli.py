@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from . import chord_shapes as chord_shapes_mod
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
@@ -206,6 +207,28 @@ def frames_for_clusters(
         console.print(
             f"  cluster {rec['cluster_id']:>4}  onset {rec.get('onset', '?'):>7.2f}s  "
             f"→ {rec.get('frame_path', '<error>')}"
+        )
+
+
+@app.command(name="chord-shape-frames")
+def chord_shape_frames(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    force: bool = typer.Option(False, "--force"),
+) -> None:
+    """Extract one representative frame per unique chord (for vision verification)."""
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Extracting chord-shape frames[/bold] for {paths.video_id}")
+    out_path = chord_shapes_mod.select_and_extract(paths, force=force)
+    import json as _json
+
+    data = _json.loads(out_path.read_text())
+    console.print(f"  [green]✓[/green] {data['chord_count']} unique chord(s) → {out_path}")
+    for chord, info in data["candidates"].items():
+        console.print(
+            f"     {chord:<8} @ {info['primary_timestamp']:>7.2f}s  "
+            f"({info['primary_duration']:.1f}s span, "
+            f"{info['total_instances']} total instance(s))"
         )
 
 

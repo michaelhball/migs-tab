@@ -123,6 +123,14 @@ class VideoPaths:
     def tuning_json(self) -> Path:
         return self.root / "tuning.json"
 
+    @property
+    def chord_shape_candidates_json(self) -> Path:
+        return self.root / "chord-shape-candidates.json"
+
+    @property
+    def chord_shapes_verified_json(self) -> Path:
+        return self.root / "chord-shapes-verified.json"
+
     def output_dir(self, output_root: Path) -> Path:
         """Return the output dir for this video. Uses a slugified version of
         the video's title from info.json so files are easy to find; falls

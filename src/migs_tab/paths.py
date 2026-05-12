@@ -117,6 +117,10 @@ class VideoPaths:
     def frets_overrides_json(self) -> Path:
         return self.root / "frets.overrides.json"
 
+    @property
+    def tuning_json(self) -> Path:
+        return self.root / "tuning.json"
+
     def output_dir(self, output_root: Path) -> Path:
         d = output_root / self.video_id
         d.mkdir(parents=True, exist_ok=True)

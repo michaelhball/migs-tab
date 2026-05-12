@@ -30,9 +30,28 @@ from .paths import DEFAULT_OUTPUT_DIR, VideoPaths
 # Constants
 # ---------------------------------------------------------------------------
 
-# Conventional tab order: top line = high E (string 5 in our internal index),
-# bottom line = low E (string 0 in our internal index).
-_TAB_STRING_LETTERS = ["e", "B", "G", "D", "A", "E"]
+# Default string letters for standard tuning (top = high E, bottom = low E).
+# Derived dynamically from the detected tuning when non-standard.
+_DEFAULT_TAB_STRING_LETTERS = ["e", "B", "G", "D", "A", "E"]
+_PITCH_NAMES_NATURAL = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+def _tab_string_letters_for_tuning(strings_midi: list[int]) -> list[str]:
+    """Top-to-bottom string labels (high E first) based on the open-string
+    pitches of the tuning. Top-string letter is lowercased; bottom is upper.
+    """
+    if not strings_midi or len(strings_midi) != 6:
+        return _DEFAULT_TAB_STRING_LETTERS
+    # strings_midi is low → high; tab is high → low.
+    labels: list[str] = []
+    for i in range(5, -1, -1):
+        name = _PITCH_NAMES_NATURAL[strings_midi[i] % 12]
+        # Top two strings lowercased by convention; rest uppercased.
+        if i >= 4:
+            name = name.lower()
+        labels.append(name)
+    return labels
+
 
 # Wrap each tab system at this many characters.
 _DEFAULT_LINE_WIDTH = 72
@@ -98,6 +117,42 @@ class RenderedSection:
     tempo_bpm: float
 
 
+@dataclass
+class TuningInfo:
+    label: str
+    capo: int
+    strings_midi: list[int]
+    source: str
+    confidence: float
+    string_letters: list[str]  # top-down (high E first)
+
+    @classmethod
+    def from_paths(cls, paths: VideoPaths) -> TuningInfo:
+        if paths.tuning_json.exists():
+            try:
+                data = json.loads(paths.tuning_json.read_text())
+                return cls(
+                    label=data.get("label", "Standard"),
+                    capo=int(data.get("capo", 0)),
+                    strings_midi=list(data.get("strings_midi", [40, 45, 50, 55, 59, 64])),
+                    source=data.get("source", "default"),
+                    confidence=float(data.get("confidence", 0.0)),
+                    string_letters=_tab_string_letters_for_tuning(
+                        data.get("strings_midi", [40, 45, 50, 55, 59, 64])
+                    ),
+                )
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+        return cls(
+            label="Standard",
+            capo=0,
+            strings_midi=[40, 45, 50, 55, 59, 64],
+            source="default",
+            confidence=0.0,
+            string_letters=list(_DEFAULT_TAB_STRING_LETTERS),
+        )
+
+
 def render(
     paths: VideoPaths,
     output_root: Path = DEFAULT_OUTPUT_DIR,
@@ -126,6 +181,8 @@ def render(
     overrides = _load_overrides(paths)
     notes = _apply_overrides(frets_data["notes"], overrides)
     notes = _filter_noise(notes)
+
+    tuning_info = TuningInfo.from_paths(paths)
 
     # Build cross-instance pitch-class support per section, so we can drop
     # canonical-instance notes that no other take confirms.
@@ -160,6 +217,7 @@ def render(
             section_notes,
             line_width=line_width,
             beat_times=beat_times,
+            string_letters=tuning_info.string_letters,
         )
         clusters_in_section = {n["cluster_id"] for n in section_notes}
         rendered.append(
@@ -176,9 +234,9 @@ def render(
             )
         )
 
-    tab_text = _format_full_tab(sections_data, rendered)
+    tab_text = _format_full_tab(sections_data, rendered, tuning_info)
     tab_path.write_text(tab_text)
-    md_path.write_text(_format_markdown(sections_data, rendered))
+    md_path.write_text(_format_markdown(sections_data, rendered, tuning_info))
     return tab_path
 
 
@@ -474,6 +532,7 @@ def _render_section_tab(
     section_notes: list[dict],
     line_width: int,
     beat_times: list[float],
+    string_letters: list[str] | None = None,
 ) -> str:
     """Render section's notes as a beat-aligned 6-line ASCII tab.
 
@@ -490,10 +549,12 @@ def _render_section_tab(
         by_cluster[n["cluster_id"]].append(n)
     cluster_ids = sorted(by_cluster, key=lambda cid: min(n["start"] for n in by_cluster[cid]))
 
+    letters = string_letters or _DEFAULT_TAB_STRING_LETTERS
+
     grid = _subdivisions_from_beats(beat_times)
     if not grid:
         # Beat detection produced nothing usable — fall back to event-ordered.
-        return _render_event_ordered(by_cluster, cluster_ids, line_width)
+        return _render_event_ordered(by_cluster, cluster_ids, line_width, letters)
 
     # Map each cluster to its nearest grid slot.
     grid_times = [t for t, _ in grid]
@@ -522,13 +583,14 @@ def _render_section_tab(
         else:
             slot_markers.append("")
 
-    return _pack_quantized(raw_cells, slot_markers, line_width)
+    return _pack_quantized(raw_cells, slot_markers, line_width, letters)
 
 
 def _render_event_ordered(
     by_cluster: dict[int, list[dict]],
     cluster_ids: list[int],
     line_width: int,
+    string_letters: list[str] | None = None,
 ) -> str:
     """Fallback when beat detection fails — old per-onset rendering."""
     raw_cells: list[list[str]] = []
@@ -547,7 +609,7 @@ def _render_event_ordered(
         cell = [c.rjust(cell_width, "-") for c in cell]
         raw_cells.append(cell)
         prev_end = cluster_end
-    return _pack_into_systems(raw_cells, line_width)
+    return _pack_into_systems(raw_cells, line_width, string_letters or _DEFAULT_TAB_STRING_LETTERS)
 
 
 def _nearest_index(sorted_times: list[float], t: float) -> int:
@@ -564,7 +626,12 @@ def _nearest_index(sorted_times: list[float], t: float) -> int:
     return i - 1 if abs(t - before) <= abs(t - after) else i
 
 
-def _pack_quantized(cells: list[list[str]], markers: list[str], line_width: int) -> str:
+def _pack_quantized(
+    cells: list[list[str]],
+    markers: list[str],
+    line_width: int,
+    string_letters: list[str],
+) -> str:
     """Pack beat-quantized cells into systems, wrapping at bar boundaries.
 
     Each subdivision-cell is prefixed by `|` (when it starts a new bar) or
@@ -604,8 +671,8 @@ def _pack_quantized(cells: list[list[str]], markers: list[str], line_width: int)
     parts: list[str] = []
     for sys_lines in systems:
         block = []
-        for letter, line in zip(_TAB_STRING_LETTERS, sys_lines, strict=True):
-            block.append(f"  {letter}|-{line}")
+        for letter, line in zip(string_letters, sys_lines, strict=True):
+            block.append(f"  {letter:>2}|-{line}")
         parts.append("\n".join(block))
     return "\n\n".join(parts)
 
@@ -615,7 +682,7 @@ def _pause_cell() -> list[str]:
     return ["---"] * 6
 
 
-def _pack_into_systems(cells: list[list[str]], line_width: int) -> str:
+def _pack_into_systems(cells: list[list[str]], line_width: int, string_letters: list[str]) -> str:
     systems: list[list[str]] = []
     current = ["" for _ in range(6)]
     for cell in cells:
@@ -632,8 +699,8 @@ def _pack_into_systems(cells: list[list[str]], line_width: int) -> str:
     parts: list[str] = []
     for sys_lines in systems:
         block = []
-        for letter, line in zip(_TAB_STRING_LETTERS, sys_lines, strict=True):
-            block.append(f"  {letter}|-{line}|")
+        for letter, line in zip(string_letters, sys_lines, strict=True):
+            block.append(f"  {letter:>2}|-{line}|")
         parts.append("\n".join(block))
     return "\n\n".join(parts)
 
@@ -643,10 +710,19 @@ def _pack_into_systems(cells: list[list[str]], line_width: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _format_full_tab(sections_data: dict, rendered: list[RenderedSection]) -> str:
+def _format_full_tab(
+    sections_data: dict, rendered: list[RenderedSection], tuning: TuningInfo
+) -> str:
     lines: list[str] = []
     video_id = sections_data.get("video_id", "?")
     lines.append(f"# migs-tab — video {video_id}")
+    lines.append("")
+    capo_str = f", capo {tuning.capo}" if tuning.capo else ""
+    lines.append(
+        f"Tuning: {tuning.label}{capo_str}  "
+        f"(strings low → high: {tuning.strings_midi}, "
+        f"detection source: {tuning.source})"
+    )
     lines.append("")
     summary = sections_data.get("structural_summary")
     if summary:
@@ -678,10 +754,18 @@ def _format_full_tab(sections_data: dict, rendered: list[RenderedSection]) -> st
     return "\n".join(lines) + "\n"
 
 
-def _format_markdown(sections_data: dict, rendered: list[RenderedSection]) -> str:
+def _format_markdown(
+    sections_data: dict, rendered: list[RenderedSection], tuning: TuningInfo
+) -> str:
     parts: list[str] = []
     video_id = sections_data.get("video_id", "?")
     parts.append(f"# migs-tab — `{video_id}`\n")
+    capo_str = f", capo {tuning.capo}" if tuning.capo else ""
+    parts.append(
+        f"**Tuning:** {tuning.label}{capo_str} · "
+        f"strings low → high: {tuning.strings_midi} · "
+        f"source: {tuning.source}\n"
+    )
     summary = sections_data.get("structural_summary")
     if summary:
         parts.append(f"_{summary}_\n")

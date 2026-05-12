@@ -35,7 +35,11 @@ from .paths import VideoPaths
 # Low E (string 6 traditionally) → high E (string 1 traditionally).
 # We index 0..5 where 0 = low E, 5 = high E; the printed tab string number
 # (the conventional 6..1) is computed as 6 - i.
-STANDARD_TUNING = (40, 45, 50, 55, 59, 64)
+STANDARD_TUNING: tuple[int, ...] = (40, 45, 50, 55, 59, 64)
+# Active tuning for the current assign_frets() run — rebound from
+# tuning.json when present. The Viterbi/shape code reads this rather than
+# the standard constant.
+_ACTIVE_TUNING: tuple[int, ...] = STANDARD_TUNING
 NUM_STRINGS = 6
 MAX_FRET = 19  # most acoustic guitars have 19-22 accessible frets
 PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -143,43 +147,61 @@ _CHORD_FILTER_VELOCITY_FLOOR = 55
 _CHORD_FILTER_NEIGHBOR_TOLERANCE = 1
 
 
-# Library of idiomatic open-position chord voicings keyed by chord name.
-# Each template maps pitch (MIDI) → (string_index, fret) under standard
-# tuning (low E = string 0). These are the cowboy chord shapes a guitarist
-# defaults to when notes are in range; the algorithm should strongly
-# prefer these voicings over arbitrary high-fret alternatives.
+# Library of idiomatic open-position chord *shapes* — string-relative
+# (string_index → fret) instead of pitch-keyed. These shapes are the
+# fingering patterns guitarists use; the pitches they produce depend on the
+# tuning. _expand_template_for_tuning() turns each shape into a pitch-keyed
+# template at runtime once we know the tuning.
 #
-# String index reminder: 0=low E (E2 open), 1=A, 2=D, 3=G, 4=B, 5=high E (E4 open).
-_CHORD_TEMPLATES: dict[str, dict[int, tuple[int, int]]] = {
-    # E minor — open
-    "Em": {40: (0, 0), 47: (1, 2), 52: (2, 2), 55: (3, 0), 59: (4, 0), 64: (5, 0)},
-    # E major — open
-    "E": {40: (0, 0), 47: (1, 2), 52: (2, 2), 56: (3, 1), 59: (4, 0), 64: (5, 0)},
-    # E7 — open (D string open in middle)
-    "E7": {40: (0, 0), 47: (1, 2), 50: (2, 0), 56: (3, 1), 59: (4, 0), 64: (5, 0)},
-    # A minor — open
-    "Am": {45: (1, 0), 52: (2, 2), 57: (3, 2), 60: (4, 1), 64: (5, 0)},
-    # A major — open
-    "A": {45: (1, 0), 52: (2, 2), 57: (3, 2), 61: (4, 2), 64: (5, 0)},
-    # A7 — open (D fret 2, G open, B fret 2, high E open)
-    "A7": {45: (1, 0), 52: (2, 2), 55: (3, 0), 61: (4, 2), 64: (5, 0)},
-    # D major — open
-    "D": {50: (2, 0), 57: (3, 2), 62: (4, 3), 66: (5, 2)},
-    # D minor — open
-    "Dm": {50: (2, 0), 57: (3, 2), 62: (4, 3), 65: (5, 1)},
-    # D7 — open
-    "D7": {50: (2, 0), 57: (3, 2), 60: (4, 1), 66: (5, 2)},
-    # G major — open (the classic 3-2-0-0-0-3 voicing)
-    "G": {43: (0, 3), 47: (1, 2), 50: (2, 0), 55: (3, 0), 59: (4, 0), 67: (5, 3)},
-    # G major — alternative (3-2-0-0-3-3 with high B fret 3)
-    "G_alt": {43: (0, 3), 47: (1, 2), 50: (2, 0), 55: (3, 0), 62: (4, 3), 67: (5, 3)},
-    # C major — open
-    "C": {48: (1, 3), 52: (2, 2), 55: (3, 0), 60: (4, 1), 64: (5, 0)},
-    # F major — small "partial F" (top four strings): D fret 3, G fret 2, B fret 1, high E fret 1
-    "F_partial": {53: (2, 3), 57: (3, 2), 60: (4, 1), 65: (5, 1)},
-    # B minor — barre at fret 2 (common in folk/rock arrangements)
-    "Bm": {47: (1, 2), 54: (2, 4), 59: (3, 4), 62: (4, 3), 66: (5, 2)},
+# String index reminder: 0=low E (E2 open in standard), 1=A, 2=D, 3=G, 4=B,
+# 5=high E. A string missing from the dict means "muted / not played".
+_CHORD_SHAPES: dict[str, dict[int, int]] = {
+    "Em": {0: 0, 1: 2, 2: 2, 3: 0, 4: 0, 5: 0},
+    "E": {0: 0, 1: 2, 2: 2, 3: 1, 4: 0, 5: 0},
+    "E7": {0: 0, 1: 2, 2: 0, 3: 1, 4: 0, 5: 0},
+    "Am": {1: 0, 2: 2, 3: 2, 4: 1, 5: 0},
+    "A": {1: 0, 2: 2, 3: 2, 4: 2, 5: 0},
+    "A7": {1: 0, 2: 2, 3: 0, 4: 2, 5: 0},
+    "D": {2: 0, 3: 2, 4: 3, 5: 2},
+    "Dm": {2: 0, 3: 2, 4: 3, 5: 1},
+    "D7": {2: 0, 3: 2, 4: 1, 5: 2},
+    "G": {0: 3, 1: 2, 2: 0, 3: 0, 4: 0, 5: 3},
+    "G_alt": {0: 3, 1: 2, 2: 0, 3: 0, 4: 3, 5: 3},
+    "C": {1: 3, 2: 2, 3: 0, 4: 1, 5: 0},
+    "F_partial": {2: 3, 3: 2, 4: 1, 5: 1},
+    "Bm": {1: 2, 2: 4, 3: 4, 4: 3, 5: 2},  # barre at fret 2
 }
+
+
+def _expand_template_for_tuning(
+    shape: dict[int, int], tuning: tuple[int, ...]
+) -> dict[int, tuple[int, int]]:
+    """Convert a shape (string→fret) into a pitch-keyed template under the
+    given tuning. The resulting dict maps absolute MIDI pitch to its
+    (string, fret) position — exactly the shape the rest of the file expects.
+    """
+    return {tuning[s] + f: (s, f) for s, f in shape.items()}
+
+
+def _build_chord_templates_for_tuning(
+    tuning: tuple[int, ...],
+) -> dict[str, dict[int, tuple[int, int]]]:
+    """Generate the full chord-template library for a specific tuning."""
+    return {
+        name: _expand_template_for_tuning(shape, tuning) for name, shape in _CHORD_SHAPES.items()
+    }
+
+
+# Default Standard-tuning templates — used when no tuning.json is present.
+_CHORD_TEMPLATES_STANDARD: dict[str, dict[int, tuple[int, int]]] = (
+    _build_chord_templates_for_tuning((40, 45, 50, 55, 59, 64))
+)
+
+# Legacy alias — most of the file still references _CHORD_TEMPLATES.
+# assign_frets() rebinds this at the module level on each run so the
+# templates match the detected tuning. (Threading-unsafe; acceptable
+# given the CLI is single-process and re-runs are explicit.)
+_CHORD_TEMPLATES: dict[str, dict[int, tuple[int, int]]] = _CHORD_TEMPLATES_STANDARD
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +263,10 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
     if not notes:
         paths.frets_json.write_text(json.dumps({"note_count": 0, "notes": []}, indent=2))
         return paths
+
+    global _ACTIVE_TUNING, _CHORD_TEMPLATES
+    _ACTIVE_TUNING = _load_active_tuning(paths)
+    _CHORD_TEMPLATES = _build_chord_templates_for_tuning(_ACTIVE_TUNING)
 
     notes = _dedupe_same_pitch_onsets(notes)
     chord_spans: list[tuple[float, float, str]] = []
@@ -312,7 +338,7 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         "cluster_count": len(cluster_records),
         "ambiguous_cluster_count": sum(1 for c in cluster_records if c["ambiguous"]),
         "unplayable_clusters": unplayable_clusters,
-        "tuning": {"low_to_high_midi": list(STANDARD_TUNING)},
+        "tuning": {"low_to_high_midi": list(_ACTIVE_TUNING)},
         "params": {
             "max_fret": MAX_FRET,
             "max_hand_span": MAX_HAND_SPAN,
@@ -394,6 +420,23 @@ def _filter_sympathetic_resonance(
 # ---------------------------------------------------------------------------
 # Pre-clustering: chord-context note filter
 # ---------------------------------------------------------------------------
+
+
+def _load_active_tuning(paths: VideoPaths) -> tuple[int, ...]:
+    """Load the per-video tuning from tuning.json (capo applied), else default
+    to Standard. Returns a 6-tuple of MIDI pitches for open strings
+    low → high. Capo is applied by adding the capo fret to every string."""
+    if not paths.tuning_json.exists():
+        return STANDARD_TUNING
+    try:
+        data = json.loads(paths.tuning_json.read_text())
+    except json.JSONDecodeError:
+        return STANDARD_TUNING
+    strings = data.get("strings_midi") or list(STANDARD_TUNING)
+    capo = int(data.get("capo", 0))
+    if len(strings) != NUM_STRINGS:
+        return STANDARD_TUNING
+    return tuple(int(p) + capo for p in strings)
 
 
 def _load_chord_spans(structure_json_path) -> list[tuple[float, float, str]]:
@@ -577,7 +620,7 @@ def _enumerate_shapes(
         pitch = notes[nidx]["pitch"]
         opts: list[tuple[int, int]] = []
         for s in range(NUM_STRINGS):
-            fret = pitch - STANDARD_TUNING[s]
+            fret = pitch - _ACTIVE_TUNING[s]
             if 0 <= fret <= MAX_FRET:
                 opts.append((s, fret))
         per_note_options.append(opts)

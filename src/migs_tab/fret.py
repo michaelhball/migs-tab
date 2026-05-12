@@ -557,6 +557,7 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         notes = _filter_by_chord_context(notes, chord_spans)
     clusters = _cluster_notes_by_onset(notes)
     notes, clusters = _filter_sympathetic_resonance(notes, clusters)
+    notes, clusters = _filter_harmonic_overtones(notes, clusters)
     cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
 
     # Drop clusters where no playable shape exists — these are pitches
@@ -633,6 +634,85 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
     }
     paths.frets_json.write_text(json.dumps(out, indent=2))
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Post-clustering: harmonic-overtone filter
+# ---------------------------------------------------------------------------
+
+# Intervals (in semitones) above a struck pitch where its harmonic overtones
+# show up most prominently. basic-pitch occasionally reports these as
+# separate notes — they aren't intentional plays.
+#   +12 = octave (2nd harmonic)
+#   +19 = octave + perfect 5th (3rd harmonic)
+#   +24 = two octaves (4th harmonic)
+_HARMONIC_OFFSETS = (12, 19, 24)
+
+# A note is considered a harmonic of a louder same-cluster note only if its
+# velocity is below this fraction of the source's velocity. The first
+# harmonic is typically much quieter than the struck fundamental.
+_HARMONIC_VELOCITY_RATIO = 0.7
+
+
+def _filter_harmonic_overtones(
+    notes: list[dict], clusters: list[list[int]]
+) -> tuple[list[dict], list[list[int]]]:
+    """Drop notes within a cluster that look like overtones of a louder note
+    in the same cluster.
+
+    Specifically: for each cluster, take the loudest note; then drop any
+    other note in the cluster whose pitch is exactly +12 / +19 / +24
+    semitones above a louder note's pitch AND whose velocity is below
+    ``_HARMONIC_VELOCITY_RATIO`` of that louder note's velocity.
+
+    Skipped for single-note clusters (no peer to compare against).
+    """
+    if not clusters:
+        return notes, clusters
+
+    keep_mask = [True] * len(notes)
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        # Sort the cluster's notes by velocity descending so we can use
+        # higher-velocity notes as "sources" for harmonic detection.
+        sorted_idx = sorted(cluster, key=lambda i: notes[i].get("velocity", 0), reverse=True)
+        for i, candidate_idx in enumerate(sorted_idx):
+            if not keep_mask[candidate_idx]:
+                continue
+            candidate = notes[candidate_idx]
+            candidate_vel = candidate.get("velocity", 0)
+            # Check whether any LOUDER note in the cluster has a pitch this
+            # note is a harmonic of.
+            for source_idx in sorted_idx[:i]:
+                if not keep_mask[source_idx]:
+                    continue
+                source = notes[source_idx]
+                source_vel = source.get("velocity", 0)
+                if source_vel <= 0:
+                    continue
+                interval = candidate["pitch"] - source["pitch"]
+                if interval in _HARMONIC_OFFSETS:
+                    ratio = candidate_vel / source_vel
+                    if ratio < _HARMONIC_VELOCITY_RATIO:
+                        keep_mask[candidate_idx] = False
+                        break
+
+    if all(keep_mask):
+        return notes, clusters
+
+    old_to_new: dict[int, int] = {}
+    filtered_notes: list[dict] = []
+    for old_idx, note in enumerate(notes):
+        if keep_mask[old_idx]:
+            old_to_new[old_idx] = len(filtered_notes)
+            filtered_notes.append(note)
+    new_clusters = []
+    for cluster in clusters:
+        new_cluster = [old_to_new[i] for i in cluster if i in old_to_new]
+        if new_cluster:
+            new_clusters.append(new_cluster)
+    return filtered_notes, new_clusters
 
 
 # ---------------------------------------------------------------------------

@@ -199,6 +199,12 @@ def render(
     chord_spans = _load_chord_spans_for_render(paths)
     cross_support = _build_cross_instance_support(sections_data, notes, chord_spans)
 
+    # Track per-section data needed by the MusicXML exporter too, so the
+    # two output formats stay in lockstep (both consume the same beat grid
+    # + filtered notes).
+    notes_by_section: dict[str, list[dict]] = {}
+    beat_times_by_section: dict[str, list[float]] = {}
+
     rendered: list[RenderedSection] = []
     for section in sections_data["sections"]:
         if section["label"] in _SKIP_LABELS:
@@ -223,6 +229,8 @@ def render(
         tempo_bpm, beat_times = _detect_beats(
             paths.guitar_stem, canonical["start"], canonical["end"]
         )
+        notes_by_section[section["label"]] = section_notes
+        beat_times_by_section[section["label"]] = beat_times
         ascii_tab = _render_section_tab(
             section_notes,
             line_width=line_width,
@@ -253,6 +261,20 @@ def render(
     if paths.structure_json.exists():
         chart_text = _render_chord_chart(paths, tuning_info)
         (out_dir / "chord-chart.txt").write_text(chart_text)
+
+    # MusicXML export — opens in MuseScore / TuxGuitar / Guitar Pro.
+    from . import musicxml as musicxml_mod
+
+    xml_bytes = musicxml_mod.render_musicxml(
+        sections_data=sections_data,
+        rendered=rendered,
+        tuning=tuning_info,
+        notes_by_section=notes_by_section,
+        beat_times_by_section=beat_times_by_section,
+        subdivisions_per_beat=_SUBDIVISIONS_PER_BEAT,
+        beats_per_bar=_BEATS_PER_BAR,
+    )
+    (out_dir / "tab.musicxml").write_bytes(xml_bytes)
     return tab_path
 
 

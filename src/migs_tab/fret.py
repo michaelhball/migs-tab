@@ -183,6 +183,23 @@ _CHORD_SHAPES: dict[str, dict[int, int]] = {
     "Esus4": {0: 0, 1: 2, 2: 2, 3: 2, 4: 0, 5: 0},
     "Gsus4": {0: 3, 1: 3, 2: 0, 3: 0, 4: 1, 5: 3},  # G with C in the chord
     "Cadd9": {1: 3, 2: 2, 3: 0, 4: 3, 5: 0},
+    # Major 7th — show up in jazzier acoustic playing
+    "Cmaj7": {1: 3, 2: 2, 3: 0, 4: 0, 5: 0},
+    "Amaj7": {1: 0, 2: 2, 3: 1, 4: 2, 5: 0},
+    "Dmaj7": {2: 0, 3: 2, 4: 2, 5: 2},
+    "Fmaj7": {2: 3, 3: 2, 4: 1, 5: 0},
+    "Gmaj7": {0: 3, 2: 0, 3: 0, 4: 0, 5: 2},
+    "Emaj7": {0: 0, 1: 2, 2: 1, 3: 1, 4: 0, 5: 0},
+    # 6th chords
+    "C6": {1: 3, 2: 2, 3: 2, 4: 1, 5: 0},
+    "G6": {0: 3, 2: 0, 3: 0, 4: 0, 5: 0},
+    "A6": {1: 0, 2: 2, 3: 2, 4: 2, 5: 2},
+    # Diminished + augmented (rarer but real)
+    "Bdim": {1: 2, 2: 3, 3: 4, 4: 3},
+    "Caug": {1: 3, 2: 2, 3: 1, 4: 1, 5: 0},
+    # 7sus4 — common Stones / folk variant
+    "D7sus4": {2: 0, 3: 2, 4: 1, 5: 3},
+    "A7sus4": {1: 0, 2: 2, 3: 0, 4: 3, 5: 0},
 }
 
 # Per-tuning shape overrides + additions. A tuning name in this dict gets
@@ -233,6 +250,51 @@ _TUNING_SPECIFIC_SHAPES: dict[str, dict[str, dict[int, int]]] = {
         "D5": {0: 0, 1: 0, 5: 0},
         # A-family stays the same (doesn't touch either E string).
     },
+    # DADGAD (D A D G A D) — modal Celtic/folk tuning. All-open strings
+    # sound a Dsus4 (D-A-D-G-A-D = D root + sus4 G + 5 A + octave D).
+    # Many chords are barre-style across all strings at a given fret;
+    # the SHAPE for "fret N" produces a sus4 chord rooted at D + N semitones.
+    "DADGAD": {
+        # All-open = Dsus4.
+        "Dsus4_dadgad_open": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+        # D5 — just the bass strings.
+        "D5": {0: 0, 1: 0, 2: 0, 5: 0},
+        # Common DADGAD D voicing — fret G string to F# (3rd) to get D major.
+        "D_dadgad": {0: 0, 1: 0, 2: 0, 3: 4, 4: 0, 5: 0},
+        # G "drone" voicing (G with low D in bass).
+        "G_dadgad": {0: 5, 1: 5, 2: 0, 3: 0, 4: 0, 5: 5},
+        # A voicing (barre at fret 7 across top strings is common, but
+        # an A with open A bass works too).
+        "A_dadgad": {1: 0, 2: 7, 3: 2, 4: 0, 5: 7},
+        # Bm-ish at fret 4 with bass droning.
+        "Em_dadgad": {0: 2, 1: 2, 2: 2, 3: 0, 4: 0, 5: 2},
+    },
+    # Open D (D A D F# A D) — the entire open guitar sounds a D major.
+    # Barre any fret N to get a major chord rooted D + N semitones.
+    "Open D": {
+        "D_open": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},  # all open = D major
+        "G_open_d": {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5},  # barre at 5 = G
+        "A_open_d": {0: 7, 1: 7, 2: 7, 3: 7, 4: 7, 5: 7},  # barre at 7 = A
+        "F_open_d": {0: 3, 1: 3, 2: 3, 3: 3, 4: 3, 5: 3},  # barre at 3 = F
+        "Em_open_d": {0: 2, 2: 2, 3: 0, 4: 0, 5: 2},  # mod-Em voicing
+        # D5 = just the bass D and A
+        "D5": {0: 0, 1: 0},
+    },
+    # Open G (D G D G B D) — full open strings sound G major (G B D).
+    "Open G": {
+        "G_open_g": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},  # all open = G
+        "C_open_g": {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5},  # barre at 5 = C
+        "D_open_g": {0: 7, 1: 7, 2: 7, 3: 7, 4: 7, 5: 7},  # barre at 7 = D
+        "A_open_g": {0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2},  # barre at 2 = A
+        "F_open_g": {0: 10, 1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+    },
+    # Open E (E B E G# B E) — full open = E major.
+    "Open E": {
+        "E_open_e": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+        "A_open_e": {0: 5, 1: 5, 2: 5, 3: 5, 4: 5, 5: 5},
+        "B_open_e": {0: 7, 1: 7, 2: 7, 3: 7, 4: 7, 5: 7},
+        "D_open_e": {0: 10, 1: 10, 2: 10, 3: 10, 4: 10, 5: 10},
+    },
 }
 
 
@@ -250,10 +312,20 @@ def _expand_template_for_tuning(
 # (longest) pattern that's a subset of the cluster's intervals, so order
 # below is just for readability — the algorithm doesn't care.
 _QUALITY_PATTERNS: list[tuple[str, frozenset[int]]] = [
+    ("maj9", frozenset({0, 2, 4, 7, 11})),
+    ("9", frozenset({0, 2, 4, 7, 10})),
+    ("m9", frozenset({0, 2, 3, 7, 10})),
     ("maj7", frozenset({0, 4, 7, 11})),
     ("m7", frozenset({0, 3, 7, 10})),
     ("7", frozenset({0, 4, 7, 10})),
+    ("6", frozenset({0, 4, 7, 9})),
+    ("m6", frozenset({0, 3, 7, 9})),
+    ("6", frozenset({0, 4, 9})),  # 6 with no 5 — very common open voicing
+    ("m6", frozenset({0, 3, 9})),
+    ("7sus4", frozenset({0, 5, 7, 10})),
     ("add9", frozenset({0, 2, 4, 7})),
+    ("dim", frozenset({0, 3, 6})),
+    ("aug", frozenset({0, 4, 8})),
     ("m", frozenset({0, 3, 7})),
     ("", frozenset({0, 4, 7})),
     ("sus2", frozenset({0, 2, 7})),

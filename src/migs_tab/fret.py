@@ -156,6 +156,7 @@ _CHORD_FILTER_NEIGHBOR_TOLERANCE = 1
 # String index reminder: 0=low E (E2 open in standard), 1=A, 2=D, 3=G, 4=B,
 # 5=high E. A string missing from the dict means "muted / not played".
 _CHORD_SHAPES: dict[str, dict[int, int]] = {
+    # Triads — major / minor / dominant 7th open shapes
     "Em": {0: 0, 1: 2, 2: 2, 3: 0, 4: 0, 5: 0},
     "E": {0: 0, 1: 2, 2: 2, 3: 1, 4: 0, 5: 0},
     "E7": {0: 0, 1: 2, 2: 0, 3: 1, 4: 0, 5: 0},
@@ -170,6 +171,18 @@ _CHORD_SHAPES: dict[str, dict[int, int]] = {
     "C": {1: 3, 2: 2, 3: 0, 4: 1, 5: 0},
     "F_partial": {2: 3, 3: 2, 4: 1, 5: 1},
     "Bm": {1: 2, 2: 4, 3: 4, 4: 3, 5: 2},  # barre at fret 2
+    # Minor 7ths — very common, drop the root's lower octave for a richer sound
+    "Em7": {0: 0, 1: 2, 2: 0, 3: 0, 4: 0, 5: 0},
+    "Am7": {1: 0, 2: 2, 3: 0, 4: 1, 5: 0},
+    "Dm7": {2: 0, 3: 2, 4: 1, 5: 1},
+    # Suspended 2 / suspended 4 — show up constantly in folk + rock
+    "Asus2": {1: 0, 2: 2, 3: 2, 4: 0, 5: 0},
+    "Asus4": {1: 0, 2: 2, 3: 2, 4: 3, 5: 0},
+    "Dsus2": {2: 0, 3: 2, 4: 3, 5: 0},
+    "Dsus4": {2: 0, 3: 2, 4: 3, 5: 3},
+    "Esus4": {0: 0, 1: 2, 2: 2, 3: 2, 4: 0, 5: 0},
+    "Gsus4": {0: 3, 1: 3, 2: 0, 3: 0, 4: 1, 5: 3},  # G with C in the chord
+    "Cadd9": {1: 3, 2: 2, 3: 0, 4: 3, 5: 0},
 }
 
 # Per-tuning shape overrides + additions. A tuning name in this dict gets
@@ -233,14 +246,18 @@ def _expand_template_for_tuning(
     return {tuning[s] + f: (s, f) for s, f in shape.items()}
 
 
-# Chord-quality patterns, ordered specific-to-general so we pick the most
-# descriptive match. Each entry is (suffix, interval-set-from-root).
+# Chord-quality patterns. _sounding_chord_name picks the most specific
+# (longest) pattern that's a subset of the cluster's intervals, so order
+# below is just for readability — the algorithm doesn't care.
 _QUALITY_PATTERNS: list[tuple[str, frozenset[int]]] = [
     ("maj7", frozenset({0, 4, 7, 11})),
     ("m7", frozenset({0, 3, 7, 10})),
     ("7", frozenset({0, 4, 7, 10})),
+    ("add9", frozenset({0, 2, 4, 7})),
     ("m", frozenset({0, 3, 7})),
     ("", frozenset({0, 4, 7})),
+    ("sus2", frozenset({0, 2, 7})),
+    ("sus4", frozenset({0, 5, 7})),
     ("5", frozenset({0, 7})),
 ]
 

@@ -227,7 +227,8 @@ def chord_shape_frames(
     for chord, info in data["candidates"].items():
         console.print(
             f"     {chord:<8} @ {info['primary_timestamp']:>7.2f}s  "
-            f"({info['primary_duration']:.1f}s span, "
+            f"(sharpness {info.get('primary_sharpness', 0):.0f}, "
+            f"{info.get('primary_span_duration', 0):.1f}s span, "
             f"{info['total_instances']} total instance(s))"
         )
 

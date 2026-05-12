@@ -41,6 +41,13 @@ from .paths import VideoPaths
 # usually settled into the fingering only after a beat or so.
 _MIN_SPAN_DURATION = 1.0
 
+# Skip chord spans whose start is within this many seconds of the video's
+# end. YouTube auto-inserts an end-screen overlay (subscribe / next-video
+# thumbnails) that obscures the guitar, AND the outro music often produces
+# spurious chord detections from a quick final chord stab. Both make those
+# frames useless for chord-shape verification.
+_END_OF_VIDEO_GUARD_S = 25.0
+
 # Sample frames at these fractions within a single span. Avoiding the very
 # edges (0 = right before strum, 1 = right before next chord change) catches
 # the middle where the hand is most stable.
@@ -103,13 +110,18 @@ def select_and_extract(paths: VideoPaths, force: bool = False) -> Path:
         )
 
     data = json.loads(paths.structure_json.read_text())
+    video_duration = float(data.get("audio_duration", 0.0))
+    end_guard_cutoff = video_duration - _END_OF_VIDEO_GUARD_S
 
-    # Group spans by chord.
+    # Group spans by chord. Drop spans in the very last few seconds of the
+    # video so end-screen overlay frames don't sneak in.
     spans_by_chord: dict[str, list[dict]] = defaultdict(list)
     for seg in data.get("playing_segments", []):
         for c in seg.get("chords", []):
             duration = c["end"] - c["start"]
             if duration < _MIN_SPAN_DURATION:
+                continue
+            if end_guard_cutoff > 0 and c["start"] >= end_guard_cutoff:
                 continue
             spans_by_chord[c["chord"]].append(
                 {

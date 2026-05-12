@@ -233,6 +233,50 @@ def _expand_template_for_tuning(
     return {tuning[s] + f: (s, f) for s, f in shape.items()}
 
 
+# Chord-quality patterns, ordered specific-to-general so we pick the most
+# descriptive match. Each entry is (suffix, interval-set-from-root).
+_QUALITY_PATTERNS: list[tuple[str, frozenset[int]]] = [
+    ("maj7", frozenset({0, 4, 7, 11})),
+    ("m7", frozenset({0, 3, 7, 10})),
+    ("7", frozenset({0, 4, 7, 10})),
+    ("m", frozenset({0, 3, 7})),
+    ("", frozenset({0, 4, 7})),
+    ("5", frozenset({0, 7})),
+]
+
+
+def _sounding_chord_name(shape: dict[int, int], tuning: tuple[int, ...]) -> str | None:
+    """Compute the chord name that a SHAPE produces under a TUNING.
+
+    Used to key chord templates by the *sounding* chord rather than the
+    original shape's name — so a Drop-D player who uses an "Am shape"
+    (still sounds as Am) and a capo-3 Standard player who uses the same
+    "Am shape" (sounds as Cm) both land on the correct template lookup
+    when structure.json reports the actual sounding chord.
+
+    Returns None if the pitch set doesn't form a recognizable chord
+    (e.g. a 2-note interval that isn't a power chord).
+    """
+    if not shape:
+        return None
+    pitches = [tuning[s] + f for s, f in shape.items()]
+    if not pitches:
+        return None
+    # Heuristic: the lowest fretted pitch is the chord's bass / root for
+    # every shape in our library. (None of our shapes are inversions.)
+    root_pc = min(pitches) % 12
+    intervals = frozenset((p - root_pc) % 12 for p in pitches)
+    best_match: tuple[str, int] | None = None
+    for suffix, pattern in _QUALITY_PATTERNS:
+        if pattern.issubset(intervals):
+            specificity = len(pattern)
+            if best_match is None or specificity > best_match[1]:
+                best_match = (suffix, specificity)
+    if best_match is None:
+        return None
+    return PITCH_NAMES[root_pc] + best_match[0]
+
+
 def _shapes_for_tuning_label(tuning_label: str) -> dict[str, dict[int, int]]:
     """Return the shape library for a tuning label: base shapes overlaid by
     the tuning-specific overrides (when any are defined)."""
@@ -248,9 +292,28 @@ def _build_chord_templates_for_tuning(
     tuning: tuple[int, ...],
     tuning_label: str = "Standard",
 ) -> dict[str, dict[int, tuple[int, int]]]:
-    """Generate the full chord-template library for a specific tuning."""
+    """Generate the chord-template library for a specific tuning, keyed by
+    the SOUNDING chord name (not the shape name).
+
+    For Standard tuning with no capo, this is essentially the same as
+    keying by shape name (Am-shape sounds as Am). For capo'd Standard
+    tuning, alternate tunings, etc., the sounding name differs — and
+    this keying makes structure.json's chord-name lookups (which use
+    the sounding chord) match the right template.
+
+    When two shapes produce the same sounding chord, the first one in
+    the shape library wins (typically the simpler open voicing).
+    """
     shapes = _shapes_for_tuning_label(tuning_label)
-    return {name: _expand_template_for_tuning(shape, tuning) for name, shape in shapes.items()}
+    templates: dict[str, dict[int, tuple[int, int]]] = {}
+    for shape in shapes.values():
+        sounding = _sounding_chord_name(shape, tuning)
+        if sounding is None:
+            continue
+        if sounding in templates:
+            continue
+        templates[sounding] = _expand_template_for_tuning(shape, tuning)
+    return templates
 
 
 # Default Standard-tuning templates — used when no tuning.json is present.

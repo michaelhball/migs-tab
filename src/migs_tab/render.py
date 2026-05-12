@@ -776,11 +776,11 @@ def _format_full_tab(
     video_id = sections_data.get("video_id", "?")
     lines.append(f"# migs-tab — video {video_id}")
     lines.append("")
-    capo_str = f", capo {tuning.capo}" if tuning.capo else ""
+    lines.append(f"Tuning: {tuning.label}")
+    if tuning.capo:
+        lines.append(f"Capo:   fret {tuning.capo}  (fret numbers below are RELATIVE to the capo)")
     lines.append(
-        f"Tuning: {tuning.label}{capo_str}  "
-        f"(strings low → high: {tuning.strings_midi}, "
-        f"detection source: {tuning.source})"
+        f"Strings (low → high): {tuning.strings_midi}  · detection source: {tuning.source}"
     )
     lines.append("")
     summary = sections_data.get("structural_summary")
@@ -819,11 +819,13 @@ def _format_markdown(
     parts: list[str] = []
     video_id = sections_data.get("video_id", "?")
     parts.append(f"# migs-tab — `{video_id}`\n")
-    capo_str = f", capo {tuning.capo}" if tuning.capo else ""
+    parts.append(f"**Tuning:** {tuning.label}")
+    if tuning.capo:
+        parts.append(
+            f"  \n**Capo:** fret {tuning.capo} _(fret numbers in tabs are relative to the capo)_"
+        )
     parts.append(
-        f"**Tuning:** {tuning.label}{capo_str} · "
-        f"strings low → high: {tuning.strings_midi} · "
-        f"source: {tuning.source}\n"
+        f"  \nStrings low → high: `{tuning.strings_midi}` · detection source: `{tuning.source}`\n"
     )
     summary = sections_data.get("structural_summary")
     if summary:

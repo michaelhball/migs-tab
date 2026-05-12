@@ -53,6 +53,7 @@ DEFAULT_TUNING_LABEL = "Standard"
 _TUNING_LIBRARY: dict[str, list[int]] = {
     "Standard": [40, 45, 50, 55, 59, 64],
     "Drop D": [38, 45, 50, 55, 59, 64],
+    "Double Drop D": [38, 45, 50, 55, 59, 62],  # both E strings tuned to D
     "Half-step down": [39, 44, 49, 54, 58, 63],
     "Whole-step down": [38, 43, 48, 53, 57, 62],
     "Drop D, half-step down": [37, 44, 49, 54, 58, 63],
@@ -137,9 +138,21 @@ def detect_tuning(paths: VideoPaths, force: bool = False) -> VideoPaths:
 _CAPTION_PATTERNS: list[tuple[str, str, dict]] = [
     # DADGAD is unambiguous on its own.
     (r"\bdadgad\b", "DADGAD", {"strings_midi": _TUNING_LIBRARY["DADGAD"]}),
-    # Drop D: require tuning context.
+    # Double Drop D — must come BEFORE the bare Drop D pattern so it wins.
+    # Accepts "double drop d tuning" / "tuned to double drop d" / etc.
+    (
+        r"\b(?:(?:tuned\s+to|tune\s+to|in|tuning(?:\s+is)?|we'?re\s+in|playing\s+in)\s+)?double\s+drop\s*d(?:\s+tuning)?\b",
+        "Double Drop D",
+        {"strings_midi": _TUNING_LIBRARY["Double Drop D"]},
+    ),
+    # Drop D: require tuning context (before or after).
     (
         r"\b(?:tuned\s+to|tune\s+to|tuning(?:\s+is)?|we'?re\s+in|playing\s+in)\s+drop\s*d\b",
+        "Drop D",
+        {"strings_midi": _TUNING_LIBRARY["Drop D"]},
+    ),
+    (
+        r"\bdrop\s*d\s+tuning\b",
         "Drop D",
         {"strings_midi": _TUNING_LIBRARY["Drop D"]},
     ),

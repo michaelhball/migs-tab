@@ -172,6 +172,56 @@ _CHORD_SHAPES: dict[str, dict[int, int]] = {
     "Bm": {1: 2, 2: 4, 3: 4, 4: 3, 5: 2},  # barre at fret 2
 }
 
+# Per-tuning shape overrides + additions. A tuning name in this dict gets
+# its base shapes (above) ADDITIONALLY overridden / extended by the entries
+# here. Tunings not in this dict use the base shapes verbatim.
+#
+# Drop D: the low E string is tuned down to D, so any shape that fretted
+# the low E string at fret N to get an E-rooted note now produces a D-rooted
+# note instead. We re-fret those shapes (E/Em/E7 frets shift up 2; G shifts
+# up 2 on the low string) and add a few drop-D-specific shapes (D power
+# chord with low D drone, full open D including the low D).
+#
+# Half-step-down and whole-step-down DON'T need shape overrides: every
+# string is detuned uniformly, so the SHAPES (relative frets) are identical
+# — only the resulting sounding pitches shift, which the chord-name
+# detection in structure.py handles independently.
+_TUNING_SPECIFIC_SHAPES: dict[str, dict[str, dict[int, int]]] = {
+    "Drop D": {
+        # Adjust shapes that touched the low E string — string 0 frets +2 to
+        # compensate for the string being tuned a whole step down.
+        "Em": {0: 2, 1: 2, 2: 2, 3: 0, 4: 0, 5: 0},
+        "E": {0: 2, 1: 2, 2: 2, 3: 1, 4: 0, 5: 0},
+        "E7": {0: 2, 1: 2, 2: 0, 3: 1, 4: 0, 5: 0},
+        "G": {0: 5, 1: 2, 2: 0, 3: 0, 4: 0, 5: 3},
+        "G_alt": {0: 5, 1: 2, 2: 0, 3: 0, 4: 3, 5: 3},
+        # Drop-D-specific voicings — full open D with the low D as bass.
+        "D_dropD": {0: 0, 1: 0, 2: 0, 3: 2, 4: 3, 5: 2},
+        # Power chord on the low strings (used a lot in drop D).
+        "D5": {0: 0, 1: 0},
+    },
+    "Double Drop D": {
+        # Both the low AND high E strings are tuned down to D. We need to
+        # adjust shapes that touch EITHER string. The middle four strings
+        # are still tuned the same as standard, so any shape that stays on
+        # them is unchanged.
+        # E-family: low D at fret 2 = E2; high D at fret 2 = E4.
+        "Em": {0: 2, 1: 2, 2: 2, 3: 0, 4: 0, 5: 2},
+        "E": {0: 2, 1: 2, 2: 2, 3: 1, 4: 0, 5: 2},
+        "E7": {0: 2, 1: 2, 2: 0, 3: 1, 4: 0, 5: 2},
+        # G-family: low D fret 5 = G2; high D fret 5 = G4.
+        "G": {0: 5, 1: 2, 2: 0, 3: 0, 4: 0, 5: 5},
+        "G_alt": {0: 5, 1: 2, 2: 0, 3: 0, 4: 3, 5: 5},
+        # D shapes: high D open = D5, so the typical open-D fingering with
+        # the high E becomes a D drone instead. Several useful variants:
+        "D_ddD": {0: 0, 1: 0, 2: 0, 3: 2, 4: 3, 5: 0},  # both Ds drone
+        "D_ddD_open": {2: 0, 3: 2, 4: 3, 5: 0},  # without low D
+        # D5 power chord with low + high D drones.
+        "D5": {0: 0, 1: 0, 5: 0},
+        # A-family stays the same (doesn't touch either E string).
+    },
+}
+
 
 def _expand_template_for_tuning(
     shape: dict[int, int], tuning: tuple[int, ...]
@@ -183,18 +233,29 @@ def _expand_template_for_tuning(
     return {tuning[s] + f: (s, f) for s, f in shape.items()}
 
 
+def _shapes_for_tuning_label(tuning_label: str) -> dict[str, dict[int, int]]:
+    """Return the shape library for a tuning label: base shapes overlaid by
+    the tuning-specific overrides (when any are defined)."""
+    base = dict(_CHORD_SHAPES)
+    # Match by the tuning name without capo suffix ("Drop D, capo 2" → "Drop D").
+    base_label = tuning_label.split(",")[0].strip()
+    overrides = _TUNING_SPECIFIC_SHAPES.get(base_label, {})
+    base.update(overrides)
+    return base
+
+
 def _build_chord_templates_for_tuning(
     tuning: tuple[int, ...],
+    tuning_label: str = "Standard",
 ) -> dict[str, dict[int, tuple[int, int]]]:
     """Generate the full chord-template library for a specific tuning."""
-    return {
-        name: _expand_template_for_tuning(shape, tuning) for name, shape in _CHORD_SHAPES.items()
-    }
+    shapes = _shapes_for_tuning_label(tuning_label)
+    return {name: _expand_template_for_tuning(shape, tuning) for name, shape in shapes.items()}
 
 
 # Default Standard-tuning templates — used when no tuning.json is present.
 _CHORD_TEMPLATES_STANDARD: dict[str, dict[int, tuple[int, int]]] = (
-    _build_chord_templates_for_tuning((40, 45, 50, 55, 59, 64))
+    _build_chord_templates_for_tuning((40, 45, 50, 55, 59, 64), "Standard")
 )
 
 # Legacy alias — most of the file still references _CHORD_TEMPLATES.
@@ -266,7 +327,8 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
 
     global _ACTIVE_TUNING, _CHORD_TEMPLATES
     _ACTIVE_TUNING = _load_active_tuning(paths)
-    _CHORD_TEMPLATES = _build_chord_templates_for_tuning(_ACTIVE_TUNING)
+    tuning_label = _load_tuning_label(paths)
+    _CHORD_TEMPLATES = _build_chord_templates_for_tuning(_ACTIVE_TUNING, tuning_label)
 
     notes = _dedupe_same_pitch_onsets(notes)
     chord_spans: list[tuple[float, float, str]] = []
@@ -437,6 +499,17 @@ def _load_active_tuning(paths: VideoPaths) -> tuple[int, ...]:
     if len(strings) != NUM_STRINGS:
         return STANDARD_TUNING
     return tuple(int(p) + capo for p in strings)
+
+
+def _load_tuning_label(paths: VideoPaths) -> str:
+    """Read the tuning label from tuning.json, defaulting to 'Standard'."""
+    if not paths.tuning_json.exists():
+        return "Standard"
+    try:
+        data = json.loads(paths.tuning_json.read_text())
+    except json.JSONDecodeError:
+        return "Standard"
+    return data.get("label", "Standard")
 
 
 def _load_chord_spans(structure_json_path) -> list[tuple[float, float, str]]:

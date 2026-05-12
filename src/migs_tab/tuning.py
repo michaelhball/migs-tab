@@ -230,12 +230,41 @@ def _detect_from_captions(paths: VideoPaths) -> Tuning | None:
 # ---------------------------------------------------------------------------
 
 
+# Candidate (base_tuning_label, base_pitches, capo) pairs to test against the
+# detected lowest sustained pitch. The capo extension is what gives us
+# audio capo detection — the same Standard tuning is tried at every capo
+# position from 0 to 7, and the closest match wins.
+_AUDIO_CANDIDATES: list[tuple[str, list[int], int]] = []
+
+
+def _build_audio_candidates() -> list[tuple[str, list[int], int]]:
+    capo_eligible = {
+        "Standard": list(range(0, 8)),  # 0..7
+        "Drop D": list(range(0, 4)),
+        "Half-step down": [0],
+        "Whole-step down": [0],
+        "Drop D, half-step down": [0],
+        "DADGAD": [0],
+        "Open D": [0],
+        "Open G": [0],
+        "Open E": [0],
+    }
+    out: list[tuple[str, list[int], int]] = []
+    for label, midis in _TUNING_LIBRARY.items():
+        capos = capo_eligible.get(label, [0])
+        for c in capos:
+            out.append((label, midis, c))
+    return out
+
+
+_AUDIO_CANDIDATES = _build_audio_candidates()
+
+
 def _detect_from_audio(audio_path: Path) -> Tuning | None:
     """Heuristic: load up to ~120s of audio, run pyin to get sustained pitches,
-    find the lowest reliably-detected MIDI pitch, and match to a tuning."""
+    find the lowest reliably-detected MIDI pitch, and match to a
+    (tuning, capo) pair from the candidate library."""
     try:
-        # Limit to first ~120s — usually plenty to catch the lowest open string.
-        # Sample rate 22050 is enough for pitch detection in the bass range.
         y, sr = librosa.load(str(audio_path), sr=22050, mono=True, duration=120.0)
     except Exception as e:
         return Tuning(
@@ -250,7 +279,6 @@ def _detect_from_audio(audio_path: Path) -> Tuning | None:
     if y.size == 0:
         return None
 
-    # pyin handles monophonic pitch best; for guitar audio we accept some noise.
     fmin = float(librosa.midi_to_hz(34))  # below all common tunings (low B = 35)
     fmax = float(librosa.midi_to_hz(70))  # higher than any open-string fundamental
     try:
@@ -272,32 +300,37 @@ def _detect_from_audio(audio_path: Path) -> Tuning | None:
     if valid_f0.size < 20:
         return None
 
-    # Find the lowest reliably-sustained frequency. Use the 2nd percentile
-    # rather than the absolute min to suppress one-off subharmonic artifacts.
+    # Lowest reliably-sustained frequency (2nd percentile, robust to outliers).
     low_hz = float(np.percentile(valid_f0, 2))
     low_midi = float(librosa.hz_to_midi(low_hz))
 
-    # Match against the low-E candidates from the tuning library.
-    candidates = sorted(
-        ((label, midis) for label, midis in _TUNING_LIBRARY.items()),
-        key=lambda kv: abs(low_midi - kv[1][0]),
-    )
-    best_label, best_midis = candidates[0]
-    delta = low_midi - best_midis[0]
+    # Score every (tuning, capo) candidate by how close its effective low-E
+    # pitch is to the detected lowest pitch. Tie-break: prefer no capo, then
+    # smaller capo numbers (capo'd songs are still less common than open).
+    def score(c: tuple[str, list[int], int]) -> tuple[float, int]:
+        _, midis, capo = c
+        return abs(low_midi - (midis[0] + capo)), capo
+
+    candidates = sorted(_AUDIO_CANDIDATES, key=score)
+    best_label, best_midis, best_capo = candidates[0]
+    effective_low = best_midis[0] + best_capo
+    delta = low_midi - effective_low
 
     # Confidence based on how close the detected pitch is to the candidate.
-    # Within ±0.3 semitones = very confident, ±1 = OK, beyond = low.
     confidence = max(0.0, 1.0 - min(1.0, abs(delta) / 1.0))
+
+    final_label = best_label if best_capo == 0 else f"{best_label}, capo {best_capo}"
 
     return Tuning(
         strings_midi=list(best_midis),
-        capo=0,
-        label=best_label,
+        capo=best_capo,
+        label=final_label,
         confidence=round(confidence, 3),
         source="audio",
         evidence=(
             f"lowest sustained pitch ≈ MIDI {low_midi:.2f} "
             f"({librosa.midi_to_note(low_midi, octave=True)}); "
-            f"closest open low-E candidate: {best_label} (offset {delta:+.2f} st)"
+            f"closest match: {final_label} "
+            f"(effective low {effective_low}, offset {delta:+.2f} st)"
         ),
     )

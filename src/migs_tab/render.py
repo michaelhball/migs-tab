@@ -192,11 +192,16 @@ def render(
     notes = _apply_overrides(frets_data["notes"], overrides)
     notes = _filter_noise(notes)
 
+    # Vision-verified chord shapes — for each note whose chord context has a
+    # verified (string, fret) voicing, override the algorithm's assignment.
+    chord_spans = _load_chord_spans_for_render(paths)
+    verified_shapes = _load_verified_chord_shapes(paths)
+    notes = _apply_verified_chord_shapes(notes, chord_spans, verified_shapes)
+
     tuning_info = TuningInfo.from_paths(paths)
 
     # Build cross-instance pitch-class support per section, so we can drop
     # canonical-instance notes that no other take confirms.
-    chord_spans = _load_chord_spans_for_render(paths)
     cross_support = _build_cross_instance_support(sections_data, notes, chord_spans)
 
     # Track per-section data needed by the MusicXML exporter too, so the
@@ -276,6 +281,110 @@ def render(
     )
     (out_dir / "tab.musicxml").write_bytes(xml_bytes)
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# Vision-verified chord-shape overrides
+# ---------------------------------------------------------------------------
+
+
+def _load_verified_chord_shapes(paths: VideoPaths) -> dict:
+    """Load chord-shapes-verified.json if present. The structured format is:
+
+    {
+      "video_id": "...",
+      "verified": {
+        "<chord_name>": {
+          "voicing": [
+            {"midi_pitch": <int>, "string": <0..5>, "fret": <int>},
+            ...
+          ],
+          "applies_to": "all_spans"  |  [{"start": ..., "end": ...}, ...],
+          "notes": "..."   # optional
+        }
+      }
+    }
+
+    Older narrative-style files (without an explicit ``voicing`` list per
+    chord) are loaded but have no effect — we ignore entries that don't
+    carry a structured voicing.
+    """
+    if not paths.chord_shapes_verified_json.exists():
+        return {}
+    try:
+        return json.loads(paths.chord_shapes_verified_json.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _apply_verified_chord_shapes(
+    notes: list[dict],
+    chord_spans: list[tuple[float, float, str]],
+    verified_data: dict,
+) -> list[dict]:
+    """Override (string, fret) for notes whose chord context has a verified
+    voicing for their pitch.
+
+    For each note: look up the chord active at the note's start time. If
+    the verified data has a structured ``voicing`` for that chord AND the
+    voicing covers this exact MIDI pitch AND the note's time falls inside
+    the verified entry's ``applies_to`` scope, replace the algorithm's
+    (string, fret) with the verified ones.
+    """
+    if not verified_data or not chord_spans:
+        return notes
+    verified_map = verified_data.get("verified", {})
+    if not verified_map:
+        return notes
+
+    # Pre-extract structured-voicing pitch lookups per chord.
+    by_chord: dict[str, dict[int, tuple[int, int]]] = {}
+    applies_to_by_chord: dict[str, list[dict] | str] = {}
+    for chord, entry in verified_map.items():
+        voicing = entry.get("voicing")
+        if not isinstance(voicing, list):
+            continue
+        lookup: dict[int, tuple[int, int]] = {}
+        for v in voicing:
+            try:
+                lookup[int(v["midi_pitch"])] = (int(v["string"]), int(v["fret"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if lookup:
+            by_chord[chord] = lookup
+            applies_to_by_chord[chord] = entry.get("applies_to", "all_spans")
+
+    if not by_chord:
+        return notes
+
+    out: list[dict] = []
+    for n in notes:
+        chord = _chord_for_time(chord_spans, n["start"])
+        applied = False
+        if chord and chord in by_chord:
+            applies = applies_to_by_chord[chord]
+            if applies == "all_spans" or _in_any_time_range(applies, n["start"]):
+                target = by_chord[chord].get(int(n["pitch"]))
+                if target is not None:
+                    replacement = dict(n)
+                    replacement["string"] = target[0]
+                    replacement["fret"] = target[1]
+                    replacement["overridden_by"] = f"verified-shape:{chord}"
+                    out.append(replacement)
+                    applied = True
+        if not applied:
+            out.append(n)
+    return out
+
+
+def _in_any_time_range(ranges, t: float) -> bool:
+    for r in ranges or []:
+        try:
+            if float(r["start"]) <= t < float(r["end"]):
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
 
 
 # ---------------------------------------------------------------------------

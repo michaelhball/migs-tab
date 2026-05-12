@@ -332,6 +332,36 @@ def _expand_template_for_tuning(
     return {tuning[s] + f: (s, f) for s, f in shape.items()}
 
 
+# Movable-barre fret ranges. These are the common positions where a barre
+# in each shape produces a useful, distinct sounding chord.
+_BARRE_FRETS_E_SHAPE = (1, 3, 5, 7, 8, 10)  # E-shape and Em-shape
+_BARRE_FRETS_A_SHAPE = (3, 5, 7, 8, 10)  # A-shape and Am-shape
+
+
+def _barre_shapes_for_drop_d() -> dict[str, dict[int, int]]:
+    """Drop D's low E string is D, so any movable E-shape barre needs the
+    bass string +2 frets to compensate. A-shape barres don't touch the
+    low string and are unchanged from Standard."""
+    out: dict[str, dict[int, int]] = {}
+    for n in _BARRE_FRETS_E_SHAPE:
+        out[f"E_barre_dropD_f{n}"] = {0: n + 2, 1: n + 2, 2: n + 2, 3: n + 1, 4: n, 5: n}
+        out[f"Em_barre_dropD_f{n}"] = {0: n + 2, 1: n + 2, 2: n + 2, 3: n, 4: n, 5: n}
+    return out
+
+
+def _barre_shapes_for_double_drop_d() -> dict[str, dict[int, int]]:
+    """Double Drop D has both E strings as D — E-shape barres need bass AND
+    high-E +2, and A-shape barres need high-E +2."""
+    out: dict[str, dict[int, int]] = {}
+    for n in _BARRE_FRETS_E_SHAPE:
+        out[f"E_barre_ddD_f{n}"] = {0: n + 2, 1: n + 2, 2: n + 2, 3: n + 1, 4: n, 5: n + 2}
+        out[f"Em_barre_ddD_f{n}"] = {0: n + 2, 1: n + 2, 2: n + 2, 3: n, 4: n, 5: n + 2}
+    for n in _BARRE_FRETS_A_SHAPE:
+        out[f"A_barre_ddD_f{n}"] = {1: n, 2: n + 2, 3: n + 2, 4: n + 2, 5: n + 2}
+        out[f"Am_barre_ddD_f{n}"] = {1: n, 2: n + 2, 3: n + 2, 4: n + 1, 5: n + 2}
+    return out
+
+
 # Chord-quality patterns. _sounding_chord_name picks the most specific
 # (longest) pattern that's a subset of the cluster's intervals, so order
 # below is just for readability — the algorithm doesn't care.
@@ -392,12 +422,19 @@ def _sounding_chord_name(shape: dict[int, int], tuning: tuple[int, ...]) -> str 
 
 def _shapes_for_tuning_label(tuning_label: str) -> dict[str, dict[int, int]]:
     """Return the shape library for a tuning label: base shapes overlaid by
-    the tuning-specific overrides (when any are defined)."""
+    the tuning-specific overrides (when any are defined), plus dynamically-
+    generated movable-barre variants for tunings where the low/high E
+    strings are detuned (Drop D, Double Drop D)."""
     base = dict(_CHORD_SHAPES)
     # Match by the tuning name without capo suffix ("Drop D, capo 2" → "Drop D").
     base_label = tuning_label.split(",")[0].strip()
     overrides = _TUNING_SPECIFIC_SHAPES.get(base_label, {})
     base.update(overrides)
+    # Add tuning-specific movable barres.
+    if base_label == "Drop D":
+        base.update(_barre_shapes_for_drop_d())
+    elif base_label == "Double Drop D":
+        base.update(_barre_shapes_for_double_drop_d())
     return base
 
 

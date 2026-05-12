@@ -12,6 +12,7 @@ from migs_tab.fret import (
     _dedupe_same_pitch_onsets,
     _enumerate_shapes,
     _filter_by_chord_context,
+    _filter_harmonic_overtones,
     _filter_sympathetic_resonance,
     _intrinsic_cost,
     _load_active_tuning,
@@ -236,6 +237,52 @@ class TestFilterSympatheticResonance:
         notes = [{"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 30}]
         filtered_notes, _ = _filter_sympathetic_resonance(notes, [[0]])
         assert len(filtered_notes) == 1
+
+
+class TestFilterHarmonicOvertones:
+    def test_drops_octave_harmonic(self):
+        # A strong A3 (pitch 57) plus a quiet A4 (pitch 69, +12) in the same
+        # cluster — the A4 looks like the 2nd harmonic and gets dropped.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 57, "velocity": 100},
+            {"start": 1.05, "end": 1.5, "pitch": 69, "velocity": 50},
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]])
+        assert len(filtered) == 1
+        assert filtered[0]["pitch"] == 57
+
+    def test_drops_octave_plus_fifth(self):
+        # +19 semitones is the 3rd harmonic.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 45, "velocity": 100},  # A2
+            {"start": 1.0, "end": 1.5, "pitch": 64, "velocity": 40},  # A2 + 19 = E4
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]])
+        assert len(filtered) == 1
+        assert filtered[0]["pitch"] == 45
+
+    def test_keeps_loud_octave(self):
+        # If the +12 note is LOUDER (ratio >= 0.7), keep it as a real note.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 57, "velocity": 80},
+            {"start": 1.05, "end": 1.5, "pitch": 69, "velocity": 80},  # equal velocity
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]])
+        assert len(filtered) == 2
+
+    def test_keeps_non_harmonic_intervals(self):
+        # +7 (perfect 5th) is not a typical overtone — keep both.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 100},
+            {"start": 1.0, "end": 1.5, "pitch": 67, "velocity": 30},
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]])
+        assert len(filtered) == 2
+
+    def test_skips_singletons(self):
+        notes = [{"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 30}]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0]])
+        assert len(filtered) == 1
 
 
 class TestEnumerateShapes:

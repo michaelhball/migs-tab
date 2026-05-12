@@ -15,6 +15,7 @@ from migs_tab.render import (
     _load_overrides,
     _nearest_index,
     _pick_canonical_instance,
+    _refine_tempo_octave,
     _sections_from_structure,
     _subdivisions_from_beats,
     _tab_string_letters_for_tuning,
@@ -287,6 +288,42 @@ class TestLoadOverrides:
         result = _load_overrides(paths)
         assert 5 in result
         assert result[5][0]["fret"] == 7
+
+
+class TestRefineTempoOctave:
+    def test_in_range_unchanged(self):
+        tempo, beats = _refine_tempo_octave(100.0, [0.0, 0.6, 1.2, 1.8])
+        assert tempo == 100.0
+
+    def test_too_fast_gets_halved(self):
+        # Beat-track returned 240 bpm with beats at 0.25s intervals.
+        beats = [i * 0.25 for i in range(20)]
+        tempo, new_beats = _refine_tempo_octave(240.0, beats)
+        # 240 / 2 = 120 (in range).
+        assert tempo == 120.0
+        # Every other beat survives.
+        assert len(new_beats) == 10
+
+    def test_quadruple_too_fast_halves_twice(self):
+        beats = [i * 0.1 for i in range(40)]
+        tempo, new_beats = _refine_tempo_octave(360.0, beats)
+        # 360 → 180 → 90 (in range after two halvings).
+        assert tempo == 90.0
+        assert len(new_beats) == 10  # 40 / 4
+
+    def test_too_slow_gets_doubled(self):
+        # 30 bpm with beats 2s apart — actually 60 bpm.
+        beats = [0.0, 2.0, 4.0, 6.0]
+        tempo, new_beats = _refine_tempo_octave(30.0, beats)
+        # 30 * 2 = 60 (just barely in range — _TEMPO_PLAUSIBLE_MIN = 55).
+        assert tempo == 60.0
+        # Original 4 beats + 3 inserted midpoints.
+        assert len(new_beats) == 7
+
+    def test_unrecoverably_few_beats(self):
+        # Only 1 beat — can't double or halve.
+        tempo, beats = _refine_tempo_octave(300.0, [1.0])
+        assert tempo == 300.0
 
 
 class TestBuildCrossInstanceSupport:

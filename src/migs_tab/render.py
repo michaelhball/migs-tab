@@ -98,6 +98,11 @@ _SUBDIVISIONS_PER_BEAT = 2  # 8th notes; bump to 4 for 16th-note quantization
 _BEATS_PER_BAR = 4  # most acoustic guitar tutorials are in 4/4
 # Fallback tempo to use when beat tracking fails / yields no beats.
 _FALLBACK_TEMPO_BPM = 90.0
+# Plausible tempo range for acoustic guitar. librosa.beat_track sometimes
+# locks onto twice or half the real tempo; we halve or double until the
+# result lands in this range.
+_TEMPO_PLAUSIBLE_MIN = 55.0
+_TEMPO_PLAUSIBLE_MAX = 165.0
 
 
 # ---------------------------------------------------------------------------
@@ -619,12 +624,42 @@ def _apply_cross_instance_support(
 # ---------------------------------------------------------------------------
 
 
+def _refine_tempo_octave(tempo: float, beats: list[float]) -> tuple[float, list[float]]:
+    """Halve or double the tempo (and adjust beats accordingly) until it
+    lands in a plausible acoustic-guitar range.
+
+    librosa.beat.beat_track occasionally locks onto 2× or ½× the actual
+    tempo — detecting eighth notes as quarters, or half notes as quarters.
+    For each octave-wrong case there's a deterministic fix:
+     - tempo too FAST (>165): halve, taking every other detected beat.
+     - tempo too SLOW (<55): double, inserting midpoints between beats.
+
+    Loops until the tempo is in range or we run out of headroom.
+    """
+    # Halve while too fast.
+    while tempo > _TEMPO_PLAUSIBLE_MAX and len(beats) >= 4:
+        tempo = tempo / 2
+        beats = beats[::2]
+    # Double while too slow.
+    while tempo < _TEMPO_PLAUSIBLE_MIN and len(beats) >= 2:
+        doubled: list[float] = []
+        for i in range(len(beats) - 1):
+            doubled.append(beats[i])
+            doubled.append((beats[i] + beats[i + 1]) / 2.0)
+        doubled.append(beats[-1])
+        tempo = tempo * 2
+        beats = doubled
+    return tempo, beats
+
+
 def _detect_beats(audio_path: Path, start_s: float, end_s: float) -> tuple[float, list[float]]:
     """Run librosa beat tracking on the [start, end] slice of the guitar stem.
 
     Returns (tempo_bpm, absolute beat times in the video's time frame).
     Falls back to a uniform grid at ``_FALLBACK_TEMPO_BPM`` if librosa
-    finds no beats (very rare on guitar-stem audio).
+    finds no beats (very rare on guitar-stem audio). The detected tempo
+    is also refined toward the plausible 55-165 bpm range — librosa
+    sometimes returns 2× or ½× the real tempo.
     """
     if not audio_path.exists() or end_s <= start_s:
         return _FALLBACK_TEMPO_BPM, _uniform_beat_grid(start_s, end_s, _FALLBACK_TEMPO_BPM)
@@ -660,7 +695,8 @@ def _detect_beats(audio_path: Path, start_s: float, end_s: float) -> tuple[float
     while t < end_s + period / 2:
         extended.append(t)
         t += period
-    return tempo_val, extended
+    # Octave-correct the tempo if librosa returned a 2× or ½× answer.
+    return _refine_tempo_octave(tempo_val, extended)
 
 
 def _uniform_beat_grid(start_s: float, end_s: float, bpm: float) -> list[float]:

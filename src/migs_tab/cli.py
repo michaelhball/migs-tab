@@ -15,6 +15,7 @@ import typer
 from rich.console import Console
 
 from . import chord_shapes as chord_shapes_mod
+from . import doctor as doctor_mod
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
@@ -277,6 +278,24 @@ def process(
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)
+
+
+@app.command()
+def doctor() -> None:
+    """Preflight check — verify Python, ffmpeg, deps, cache state."""
+    console.print("[bold]migs-tab doctor[/bold]\n")
+    results = doctor_mod.run_checks()
+    any_failed = False
+    for r in results:
+        mark = "[green]✓[/green]" if r.ok else "[red]✗[/red]"
+        console.print(f"  {mark}  {r.name:<14} {r.detail}")
+        if not r.ok:
+            any_failed = True
+    console.print()
+    if any_failed:
+        console.print("[yellow]Some checks failed — see ✗ entries above.[/yellow]")
+        raise typer.Exit(code=1)
+    console.print("[green]All checks passed.[/green]")
 
 
 @app.command()

@@ -325,7 +325,17 @@ def _detect_from_audio(audio_path: Path) -> Tuning | None:
         return abs(low_midi - (midis[0] + capo)), capo
 
     candidates = sorted(_AUDIO_CANDIDATES, key=score)
-    best_label, best_midis, best_capo = candidates[0]
+    primary_low_delta = abs(low_midi - (candidates[0][1][0] + candidates[0][2]))
+
+    # Candidates that are nearly tied on the lowest pitch — there's no way to
+    # distinguish them from low-E alone (Drop D vs Double Drop D vs DADGAD
+    # vs Open D all have low D, for example). Use a chroma-based tiebreaker.
+    tied = [c for c in candidates if abs(low_midi - (c[1][0] + c[2])) <= primary_low_delta + 0.3]
+    if len(tied) > 1:
+        best_label, best_midis, best_capo, disambig_note = _chroma_disambiguate(y, sr, tied)
+    else:
+        best_label, best_midis, best_capo = tied[0]
+        disambig_note = ""
     effective_low = best_midis[0] + best_capo
     delta = low_midi - effective_low
 
@@ -333,6 +343,14 @@ def _detect_from_audio(audio_path: Path) -> Tuning | None:
     confidence = max(0.0, 1.0 - min(1.0, abs(delta) / 1.0))
 
     final_label = best_label if best_capo == 0 else f"{best_label}, capo {best_capo}"
+    evidence = (
+        f"lowest sustained pitch ≈ MIDI {low_midi:.2f} "
+        f"({librosa.midi_to_note(low_midi, octave=True)}); "
+        f"closest match: {final_label} "
+        f"(effective low {effective_low}, offset {delta:+.2f} st)"
+    )
+    if disambig_note:
+        evidence += f"; {disambig_note}"
 
     return Tuning(
         strings_midi=list(best_midis),
@@ -340,10 +358,62 @@ def _detect_from_audio(audio_path: Path) -> Tuning | None:
         label=final_label,
         confidence=round(confidence, 3),
         source="audio",
-        evidence=(
-            f"lowest sustained pitch ≈ MIDI {low_midi:.2f} "
-            f"({librosa.midi_to_note(low_midi, octave=True)}); "
-            f"closest match: {final_label} "
-            f"(effective low {effective_low}, offset {delta:+.2f} st)"
-        ),
+        evidence=evidence,
     )
+
+
+def _chroma_disambiguate(
+    y: np.ndarray, sr: int, tied_candidates: list[tuple[str, list[int], int]]
+) -> tuple[str, list[int], int, str]:
+    """Pick the best candidate among tunings that share an effective low pitch.
+
+    For each candidate, computes how strongly its *open-string pitch classes*
+    are represented in the audio's average chroma — the tuning whose open
+    strings show up most in the song wins.
+
+    Drop D vs Double Drop D for example: Drop D's open-string PCs include
+    E (because high E open exists), Double Drop D's don't. If the song's
+    average chroma has weak E, Double Drop D scores higher because removing
+    that low-strength PC raises its averaged score.
+    """
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    except Exception:
+        # Fall back to the first candidate if chroma fails.
+        label, midis, capo = tied_candidates[0]
+        return label, midis, capo, "chroma analysis failed; defaulted to first candidate"
+
+    pc_strength = chroma.mean(axis=1)
+    total = float(pc_strength.sum())
+    if total <= 0:
+        label, midis, capo = tied_candidates[0]
+        return label, midis, capo, "chroma was silent; defaulted to first candidate"
+    pc_strength = pc_strength / total  # normalize to fractions of total
+
+    scored: list[tuple[float, tuple[str, list[int], int]]] = []
+    for cand in tied_candidates:
+        label, midis, capo = cand
+        # Distinct pitch classes the open strings produce under this tuning.
+        pcs = set((m + capo) % 12 for m in midis)
+        # Sum of chroma strengths at those pitch classes — NOT normalized by
+        # length. The previous avg-based scoring penalized tunings with more
+        # open-string pitch classes (Drop D's 5 PCs vs DADGAD's 3); but a
+        # tuning whose open strings cover more of the song's pitches is more
+        # likely to be the right one. Using the sum rewards coverage.
+        total = sum(float(pc_strength[pc]) for pc in pcs)
+        scored.append((total, cand))
+
+    scored.sort(key=lambda kv: kv[0], reverse=True)
+    best_score, best_cand = scored[0]
+    label, midis, capo = best_cand
+    # Build the disambig note showing the runner-up for transparency.
+    runner_up_score, runner_up_cand = scored[1] if len(scored) > 1 else (0.0, None)
+    if runner_up_cand is not None:
+        note = (
+            f"chroma disambig picked {label} "
+            f"(open-pcs total chroma {best_score:.3f}) over {runner_up_cand[0]} "
+            f"({runner_up_score:.3f}) — {len(tied_candidates)} candidates tied on low pitch"
+        )
+    else:
+        note = ""
+    return label, midis, capo, note

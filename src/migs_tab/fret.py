@@ -90,13 +90,6 @@ _AMBIGUITY_MARGIN = 0.12
 # even when it's currently anchored on a high-fret passage.
 _CHORD_SHAPE_BONUS = -4.0
 
-# Per-note chord-context bias: applied PER NOTE during shape enumeration
-# when the active chord (from structure.json) has a known template and the
-# candidate shape places that pitch on the template-prescribed string/fret.
-# Smaller than the full-shape bonus because it fires for partial matches
-# too (e.g., a single arpeggiated A3 during an Am section).
-_CHORD_CONTEXT_PER_NOTE_BONUS = -1.2
-
 
 # Pitch classes (semitones mod 12, with C=0) for chord names produced by
 # structure.py. Used by the chord-context note filter to drop low-velocity
@@ -200,6 +193,37 @@ _CHORD_SHAPES: dict[str, dict[int, int]] = {
     # 7sus4 — common Stones / folk variant
     "D7sus4": {2: 0, 3: 2, 4: 1, 5: 3},
     "A7sus4": {1: 0, 2: 2, 3: 0, 4: 3, 5: 0},
+    # Movable barre shapes (Standard tuning). Same fingering pattern at
+    # different fret positions produces different sounding chords — this
+    # gives the algorithm alternatives to cowboy voicings when the player
+    # is actually up the neck. Each entry here is the SHAPE at a specific
+    # fret; the sounding chord name is computed dynamically.
+    #
+    # E-shape major barre (0-2-2-1-0-0 transposed up by N).
+    "E_barre_f1": {0: 1, 1: 3, 2: 3, 3: 2, 4: 1, 5: 1},  # F
+    "E_barre_f3": {0: 3, 1: 5, 2: 5, 3: 4, 4: 3, 5: 3},  # G
+    "E_barre_f5": {0: 5, 1: 7, 2: 7, 3: 6, 4: 5, 5: 5},  # A
+    "E_barre_f7": {0: 7, 1: 9, 2: 9, 3: 8, 4: 7, 5: 7},  # B
+    "E_barre_f8": {0: 8, 1: 10, 2: 10, 3: 9, 4: 8, 5: 8},  # C
+    "E_barre_f10": {0: 10, 1: 12, 2: 12, 3: 11, 4: 10, 5: 10},  # D
+    # Em-shape minor barre (0-2-2-0-0-0 transposed).
+    "Em_barre_f3": {0: 3, 1: 5, 2: 5, 3: 3, 4: 3, 5: 3},  # Gm
+    "Em_barre_f5": {0: 5, 1: 7, 2: 7, 3: 5, 4: 5, 5: 5},  # Am
+    "Em_barre_f7": {0: 7, 1: 9, 2: 9, 3: 7, 4: 7, 5: 7},  # Bm
+    "Em_barre_f8": {0: 8, 1: 10, 2: 10, 3: 8, 4: 8, 5: 8},  # Cm
+    "Em_barre_f10": {0: 10, 1: 12, 2: 12, 3: 10, 4: 10, 5: 10},  # Dm
+    # A-shape major barre (x-0-2-2-2-0 transposed; root on A string).
+    "A_barre_f3": {1: 3, 2: 5, 3: 5, 4: 5, 5: 3},  # C
+    "A_barre_f5": {1: 5, 2: 7, 3: 7, 4: 7, 5: 5},  # D
+    "A_barre_f7": {1: 7, 2: 9, 3: 9, 4: 9, 5: 7},  # E
+    "A_barre_f8": {1: 8, 2: 10, 3: 10, 4: 10, 5: 8},  # F
+    "A_barre_f10": {1: 10, 2: 12, 3: 12, 4: 12, 5: 10},  # G
+    # Am-shape minor barre (x-0-2-2-1-0 transposed; root on A string).
+    "Am_barre_f3": {1: 3, 2: 5, 3: 5, 4: 4, 5: 3},  # Cm
+    "Am_barre_f5": {1: 5, 2: 7, 3: 7, 4: 6, 5: 5},  # Dm
+    "Am_barre_f7": {1: 7, 2: 9, 3: 9, 4: 8, 5: 7},  # Em
+    "Am_barre_f8": {1: 8, 2: 10, 3: 10, 4: 9, 5: 8},  # Fm
+    "Am_barre_f10": {1: 10, 2: 12, 3: 12, 4: 11, 5: 10},  # Gm
 }
 
 # Per-tuning shape overrides + additions. A tuning name in this dict gets
@@ -399,9 +423,16 @@ def _build_chord_templates_for_tuning(
         sounding = _sounding_chord_name(shape, tuning)
         if sounding is None:
             continue
-        if sounding in templates:
-            continue
-        templates[sounding] = _expand_template_for_tuning(shape, tuning)
+        # Allow multiple voicings per sounding name (cowboy Am AND barre Am
+        # at fret 5 both produce the sounding chord "Am"). Suffix subsequent
+        # entries with _v1, _v2, etc. so chord_shape_bonus can still match
+        # against either voicing.
+        key = sounding
+        version = 0
+        while key in templates:
+            version += 1
+            key = f"{sounding}_v{version}"
+        templates[key] = _expand_template_for_tuning(shape, tuning)
     return templates
 
 
@@ -489,7 +520,7 @@ def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
         notes = _filter_by_chord_context(notes, chord_spans)
     clusters = _cluster_notes_by_onset(notes)
     notes, clusters = _filter_sympathetic_resonance(notes, clusters)
-    cluster_shapes = [_enumerate_shapes(notes, c, chord_spans) for c in clusters]
+    cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
 
     # Drop clusters where no playable shape exists — these are pitches
     # outside guitar range or impossible-to-finger combinations. Annotate them.
@@ -829,7 +860,6 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
 def _enumerate_shapes(
     notes: list[dict],
     cluster: list[int],
-    chord_spans: list[tuple[float, float, str]],
 ) -> list[Shape]:
     """Enumerate all playable (string, fret) assignments for one cluster.
 
@@ -855,9 +885,6 @@ def _enumerate_shapes(
 
     pitches = [notes[i]["pitch"] for i in cluster]
     pitch_set = frozenset(pitches)
-    cluster_start = min(notes[i]["start"] for i in cluster)
-    context_chord = _chord_for_time(chord_spans, cluster_start) if chord_spans else None
-    context_template = _CHORD_TEMPLATES.get(context_chord) if context_chord else None
 
     shapes: list[Shape] = []
     # Cartesian product of options. Bounded since cluster sizes are small
@@ -872,45 +899,12 @@ def _enumerate_shapes(
             if span > MAX_HAND_SPAN:
                 continue
         assignments = tuple((i, s, f) for i, (s, f) in enumerate(combo))
-        cost = (
-            _intrinsic_cost(combo)
-            + _chord_shape_bonus(pitches, combo, pitch_set)
-            + _chord_context_bias(pitches, combo, context_template)
-        )
+        cost = _intrinsic_cost(combo) + _chord_shape_bonus(pitches, combo, pitch_set)
         shapes.append(Shape(assignments, cost))
 
     # Limit to the K best shapes per cluster to keep Viterbi tractable.
     shapes.sort(key=lambda x: x.cost)
     return shapes[:32]
-
-
-def _chord_context_bias(
-    pitches: list[int],
-    combo: tuple[tuple[int, int], ...],
-    context_template: dict[int, tuple[int, int]] | None,
-) -> float:
-    """Per-note bonus when the active chord's template prescribes a string/fret
-    for this pitch and the candidate combo matches it.
-
-    Unlike ``_chord_shape_bonus`` (which requires the *cluster* to be a
-    subset of a template), this bias fires even for single-note clusters —
-    so a lone A3 picked during an Am section gets pulled to G fret 2 because
-    Am's template says so.
-
-    Scaled per-note (smaller than the full-cluster bonus) so it nudges but
-    doesn't override compactness or hand-coherence when the candidate is
-    genuinely out of context.
-    """
-    if context_template is None:
-        return 0.0
-    bonus = 0.0
-    for i, (s, f) in enumerate(combo):
-        target = context_template.get(pitches[i])
-        if target is None:
-            continue
-        if target == (s, f):
-            bonus += _CHORD_CONTEXT_PER_NOTE_BONUS
-    return bonus
 
 
 def _chord_shape_bonus(

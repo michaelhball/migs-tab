@@ -247,7 +247,96 @@ def render(
     tab_text = _format_full_tab(sections_data, rendered, tuning_info)
     tab_path.write_text(tab_text)
     md_path.write_text(_format_markdown(sections_data, rendered, tuning_info))
+
+    # Also emit the chord-chart-only view (always — cheap to compute and
+    # useful for loose / live videos where the note-level tab is noisy).
+    if paths.structure_json.exists():
+        chart_text = _render_chord_chart(paths, tuning_info)
+        (out_dir / "chord-chart.txt").write_text(chart_text)
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# Chord-chart-only render mode
+# ---------------------------------------------------------------------------
+
+# Skip chord spans shorter than this when rendering the chord chart —
+# they're usually basic-pitch artifacts or quick passing chords that
+# aren't useful in a high-level chord chart.
+_CHORD_CHART_MIN_DURATION = 0.5
+
+
+def _format_time(seconds: float) -> str:
+    """Render seconds as M:SS for chord-chart timestamps."""
+    if seconds < 0:
+        seconds = 0
+    minutes = int(seconds // 60)
+    secs = int(seconds - minutes * 60)
+    return f"{minutes}:{secs:02d}"
+
+
+def _render_chord_chart(paths: VideoPaths, tuning: TuningInfo) -> str:
+    """Render a simple time → chord listing for the whole video.
+
+    Reads structure.json directly (independent of frets.json), so it
+    works for any video the pipeline has at least run structure on.
+    Useful for live performances where the 6-line tab is too noisy to
+    be worth reading but the chord progression is still solid.
+    """
+    if not paths.structure_json.exists():
+        return ""
+    data = json.loads(paths.structure_json.read_text())
+
+    lines: list[str] = []
+    video_id = data.get("video_id", "?")
+    lines.append(f"# Chord chart — video {video_id}")
+    lines.append("")
+    lines.append(f"Tuning: {tuning.label}")
+    if tuning.capo:
+        lines.append(
+            f"Capo: fret {tuning.capo}  "
+            "(chord names below are the SOUNDING chords; to play with "
+            f"your capo at fret {tuning.capo}, transpose each name down "
+            f"{tuning.capo} semitones to get the shape to finger)"
+        )
+    lines.append("")
+
+    segments = data.get("playing_segments", [])
+    if not segments:
+        lines.append("_No playing segments detected._")
+        return "\n".join(lines) + "\n"
+
+    lines.append(f"Detected {len(segments)} playing segment(s):")
+    lines.append("")
+
+    for seg in segments:
+        seg_start = _format_time(seg["start"])
+        seg_end = _format_time(seg["end"])
+        lines.append("=" * 60)
+        lines.append(f"Segment {seg['id']}   {seg_start} – {seg_end}  ({seg['duration']:.1f}s)")
+        chords = [
+            c for c in seg.get("chords", []) if (c["end"] - c["start"]) >= _CHORD_CHART_MIN_DURATION
+        ]
+        if not chords:
+            lines.append("  (no chord spans long enough to chart)")
+            lines.append("")
+            continue
+        # Collapse consecutive same-chord spans (sometimes chroma flickers).
+        collapsed: list[dict] = []
+        for c in chords:
+            if collapsed and collapsed[-1]["chord"] == c["chord"]:
+                collapsed[-1]["end"] = c["end"]
+            else:
+                collapsed.append(dict(c))
+
+        lines.append("")
+        lines.append(f"  {'time':<7} {'chord':<8} duration")
+        lines.append(f"  {'-' * 7} {'-' * 8} --------")
+        for c in collapsed:
+            dur = c["end"] - c["start"]
+            lines.append(f"  {_format_time(c['start']):<7} {c['chord']:<8} {dur:5.1f}s")
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------

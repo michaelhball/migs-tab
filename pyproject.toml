@@ -32,6 +32,7 @@ packages = ["src/migs_tab"]
 dev = [
     "ruff>=0.6",
     "pre-commit>=3.7",
+    "pytest>=9.0.3",
 ]
 
 [tool.ruff]

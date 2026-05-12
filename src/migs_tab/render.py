@@ -46,8 +46,9 @@ def _tab_string_letters_for_tuning(strings_midi: list[int]) -> list[str]:
     labels: list[str] = []
     for i in range(5, -1, -1):
         name = _PITCH_NAMES_NATURAL[strings_midi[i] % 12]
-        # Top two strings lowercased by convention; rest uppercased.
-        if i >= 4:
+        # Conventionally only the top (highest) string is lowercased to
+        # disambiguate from the bottom string when both are E.
+        if i == 5:
             name = name.lower()
         labels.append(name)
     return labels
@@ -159,12 +160,14 @@ def render(
     line_width: int = _DEFAULT_LINE_WIDTH,
     force: bool = False,
 ) -> Path:
-    """Render the section-by-section tab. Returns the tab.txt path."""
-    if not paths.sections_json.exists():
-        raise FileNotFoundError(
-            f"sections.json not found at {paths.sections_json}; run the skill's "
-            "Phase 2 step first to produce it."
-        )
+    """Render the section-by-section tab. Returns the tab.txt path.
+
+    Prefers ``sections.json`` (rich LLM-labeled sections) when present.
+    Falls back to deriving a flat list of "sections" from ``structure.json``
+    when sections.json is missing — useful for looser videos (live
+    recordings, performances without instructor commentary) where the
+    Claude-skill Phase 2 step hasn't run.
+    """
     if not paths.frets_json.exists():
         raise FileNotFoundError(
             f"frets.json not found at {paths.frets_json}; run `migs-tab frets` first."
@@ -176,7 +179,14 @@ def render(
     if tab_path.exists() and not force:
         return tab_path
 
-    sections_data = json.loads(paths.sections_json.read_text())
+    if paths.sections_json.exists():
+        sections_data = json.loads(paths.sections_json.read_text())
+    elif paths.structure_json.exists():
+        sections_data = _sections_from_structure(paths.structure_json)
+    else:
+        raise FileNotFoundError(
+            "Neither sections.json nor structure.json is available; run `migs-tab structure` first."
+        )
     frets_data = json.loads(paths.frets_json.read_text())
     overrides = _load_overrides(paths)
     notes = _apply_overrides(frets_data["notes"], overrides)
@@ -238,6 +248,55 @@ def render(
     tab_path.write_text(tab_text)
     md_path.write_text(_format_markdown(sections_data, rendered, tuning_info))
     return tab_path
+
+
+# ---------------------------------------------------------------------------
+# sections.json fallback (for looser videos)
+# ---------------------------------------------------------------------------
+
+
+def _sections_from_structure(structure_json_path: Path) -> dict:
+    """Derive a flat sections.json-shaped object from structure.json.
+
+    Each playing segment becomes a single section labeled `segment_<id>`
+    with one instance (the segment itself) at "demo_quality: normal-tempo".
+    Chord progression is the segment's chord list. This means render() can
+    work on videos that never had an LLM-driven Phase 2 labeling pass.
+    """
+    data = json.loads(structure_json_path.read_text())
+    sections: list[dict] = []
+    for seg in data.get("playing_segments", []):
+        chords = [c["chord"] for c in seg.get("chords", []) if (c["end"] - c["start"]) > 0.3]
+        if not chords:
+            continue
+        sections.append(
+            {
+                "label": f"segment_{seg['id']:02d}",
+                "description": (
+                    f"Playing segment {seg['id']}: "
+                    f"{seg['start']:.1f}-{seg['end']:.1f}s "
+                    f"({seg['duration']:.1f}s). "
+                    "Auto-derived from audio analysis (no LLM section labeling)."
+                ),
+                "chord_progression": chords,
+                "instances": [
+                    {
+                        "segment_id": seg["id"],
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "demo_quality": "normal-tempo",
+                    }
+                ],
+            }
+        )
+    return {
+        "video_id": data.get("video_id", "?"),
+        "structural_summary": (
+            f"Auto-derived from structure.json — {len(sections)} playing "
+            f"segment(s), no LLM labeling pass."
+        ),
+        "sections": sections,
+    }
 
 
 # ---------------------------------------------------------------------------

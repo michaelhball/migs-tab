@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+
 from migs_tab.fret import (
     STANDARD_TUNING,
     _build_chord_templates_for_tuning,
@@ -17,6 +19,8 @@ from migs_tab.fret import (
     _intrinsic_cost,
     _load_active_tuning,
     _load_tuning_label,
+    _min_playable_fret,
+    _octave_alternative,
     _shapes_for_tuning_label,
     _sounding_chord_name,
     assign_frets,
@@ -162,11 +166,22 @@ class TestDedupeSamePitchOnsets:
     def test_keeps_loudest_of_close_duplicates(self):
         notes = [
             {"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 50},
-            {"start": 1.10, "end": 1.5, "pitch": 60, "velocity": 80},  # louder duplicate
+            {"start": 1.05, "end": 1.5, "pitch": 60, "velocity": 80},  # louder duplicate
         ]
         result = _dedupe_same_pitch_onsets(notes)
         assert len(result) == 1
         assert result[0]["velocity"] == 80
+
+    def test_keeps_restrums_just_outside_cluster_gap(self):
+        # Regression: the window was 0.20s, which deleted genuine 16th-note
+        # re-strums (16ths at 120 bpm are 0.125s apart). Two same-pitch notes
+        # 0.12s apart are separate articulations and must BOTH survive.
+        notes = [
+            {"start": 1.0, "end": 1.1, "pitch": 60, "velocity": 70},
+            {"start": 1.12, "end": 1.22, "pitch": 60, "velocity": 70},
+        ]
+        result = _dedupe_same_pitch_onsets(notes)
+        assert len(result) == 2
 
     def test_keeps_distinct_pitches(self):
         notes = [
@@ -279,6 +294,30 @@ class TestFilterHarmonicOvertones:
         filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]])
         assert len(filtered) == 2
 
+    def test_skip_octave_keeps_genuine_octave_pair(self):
+        # Regression (Angie t=42.16 s, chroma-verified intro): the genuine
+        # F 53/65 octave pair carried pseudo-velocities 104/68 → ratio
+        # 0.654 < _HARMONIC_VELOCITY_RATIO, so this gate deleted the upper
+        # note AFTER the calibrated octave pass had decided to keep it.
+        # With skip_octave=True (audio-evidence pass ran) +12 pairs are
+        # off-limits here and both notes must survive.
+        notes = [
+            {"start": 42.16, "end": 42.9, "pitch": 53, "velocity": 104},
+            {"start": 42.26, "end": 42.9, "pitch": 65, "velocity": 68},
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]], skip_octave=True)
+        assert sorted(n["pitch"] for n in filtered) == [53, 65]
+
+    def test_skip_octave_still_drops_higher_harmonics(self):
+        # +19 (3rd harmonic) is NOT covered by salience's octave test, so it
+        # stays adjudicated here even when the audio-evidence pass ran.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 45, "velocity": 100},
+            {"start": 1.0, "end": 1.5, "pitch": 64, "velocity": 40},
+        ]
+        filtered, _ = _filter_harmonic_overtones(notes, [[0, 1]], skip_octave=True)
+        assert [n["pitch"] for n in filtered] == [45]
+
     def test_skips_singletons(self):
         notes = [{"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 30}]
         filtered, _ = _filter_harmonic_overtones(notes, [[0]])
@@ -382,3 +421,297 @@ def test_assign_frets_skips_when_cached(tmp_path):
     # Should be a no-op (cached) and not require notes.json.
     result = assign_frets(paths, force=False)
     assert result is paths
+
+
+class TestMinPlayableFret:
+    def test_open_string(self):
+        assert _min_playable_fret(64) == 0  # high E open
+
+    def test_high_only_pitch(self):
+        # A5 = 81: only reachable on the high E string at fret 17.
+        assert _min_playable_fret(81) == 17
+
+    def test_out_of_range(self):
+        assert _min_playable_fret(20) is None  # below low E
+        assert _min_playable_fret(100) is None  # above fret 19 everywhere
+
+
+class TestOctaveAlternative:
+    def test_single_note_offers_lower_octave(self):
+        # A3 (57) chosen at G-string fret 2; the octave-down reading (45)
+        # is the open A string — must be offered with an octave_shift label.
+        notes = [{"start": 0.0, "end": 0.5, "pitch": 57, "velocity": 70}]
+        chosen = _enumerate_shapes(notes, [0])[0]
+        alt = _octave_alternative(notes, [0], chosen)
+        assert alt is not None
+        # local_note_index is CLUSTER-LOCAL (overrides-schema namespace),
+        # not the global notes[]-list index.
+        assert alt["octave_shift"]["local_note_index"] == 0
+        assert alt["octave_shift"]["pitch_delta"] == -12
+        assert alt["octave_shift"]["new_pitch"] == 45
+        assert alt["assignments"] == [{"string": 1, "fret": 0}]
+
+    def test_skips_shift_onto_existing_cluster_pitch(self):
+        # Cluster already contains both 57 and 69 — shifting either onto the
+        # other would claim a unison double-stop; the only legal shifts are
+        # 57→45 / 69→81, so whatever is returned must not target 57 or 69.
+        notes = [
+            {"start": 0.0, "end": 0.5, "pitch": 57, "velocity": 70},
+            {"start": 0.0, "end": 0.5, "pitch": 69, "velocity": 70},
+        ]
+        chosen = _enumerate_shapes(notes, [0, 1])[0]
+        alt = _octave_alternative(notes, [0, 1], chosen)
+        assert alt is not None
+        assert alt["octave_shift"]["new_pitch"] not in (57, 69)
+
+
+def _write_notes(paths: VideoPaths, notes: list[dict]) -> None:
+    paths.notes_mt3_json.write_text(json.dumps({"notes": notes}))
+
+
+def test_cluster_ids_share_one_namespace_with_unplayable(tmp_path):
+    """Regression: unplayable_clusters[] used original cluster ids while kept
+    notes were renumbered — overrides and the vision pass could mis-target.
+    Now an unplayable cluster's id must never be reused by a kept cluster."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(
+        paths,
+        [
+            {"start": 0.0, "end": 0.5, "pitch": 60, "velocity": 100},
+            # Pitch 24 is below low E on every string — unplayable cluster.
+            {"start": 1.0, "end": 1.5, "pitch": 24, "velocity": 100},
+            {"start": 2.0, "end": 2.5, "pitch": 64, "velocity": 100},
+        ],
+    )
+    assign_frets(paths, force=True)
+    out = json.loads(paths.frets_json.read_text())
+    assert len(out["unplayable_clusters"]) == 1
+    unplayable_id = out["unplayable_clusters"][0]["cluster_id"]
+    assert unplayable_id == 1
+    kept_note_ids = {n["cluster_id"] for n in out["notes"]}
+    kept_record_ids = {c["cluster_id"] for c in out["clusters"]}
+    assert unplayable_id not in kept_note_ids
+    assert kept_note_ids == kept_record_ids == {0, 2}
+
+
+def test_no_stem_means_no_velocity_and_no_artifacts(tmp_path):
+    """Without a guitar stem the audio-evidence pass must be skipped: output
+    format identical to the pre-salience one."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(paths, [{"start": 0.0, "end": 0.5, "pitch": 60, "velocity": 100}])
+    assign_frets(paths, force=True)
+    out = json.loads(paths.frets_json.read_text())
+    assert "overtone_artifacts" not in out
+    assert out["params"]["audio_evidence"] is False
+    assert all("velocity" not in n for n in out["notes"])
+
+
+def test_ambiguous_cluster_lists_octave_alternative(tmp_path):
+    """A near-tie single note (G#4 = 68: B-string fret 9 vs high-E fret 4,
+    cost delta 0.05) is flagged ambiguous and must offer the octave reading
+    (G#3 = 56) as an extra alternative."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(paths, [{"start": 0.0, "end": 0.5, "pitch": 68, "velocity": 100}])
+    assign_frets(paths, force=True)
+    out = json.loads(paths.frets_json.read_text())
+    (cluster,) = out["clusters"]
+    assert cluster["ambiguous"] is True
+    octave_alts = [a for a in cluster["alternatives"] if "octave_shift" in a]
+    assert len(octave_alts) == 1
+    assert octave_alts[0]["octave_shift"]["new_pitch"] == 56
+
+
+class TestAudioEvidencePass:
+    """End-to-end assign_frets against a synthetic guitar stem."""
+
+    SR = 22050
+
+    def _write_stem(self, paths: VideoPaths, upper_amp: float) -> None:
+        """Two seconds of A4 (440 Hz) plus an A5 (880 Hz) partial at
+        ``upper_amp`` relative amplitude — the E(81)/E(69) CQT ratio tracks
+        the amplitude ratio (measured: amp 0.05 → ratio 0.035, amp 0.35 →
+        ratio 0.247)."""
+        import soundfile as sf
+
+        t = np.arange(int(self.SR * 2.0)) / self.SR
+        y = 0.5 * (np.sin(2 * np.pi * 440.0 * t) + upper_amp * np.sin(2 * np.pi * 880.0 * t))
+        paths.stems_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(paths.guitar_stem, y.astype(np.float32), self.SR)
+
+    def _octave_pair_notes(self, lower: int, upper: int) -> list[dict]:
+        return [
+            {"start": 0.5, "end": 1.5, "pitch": lower, "velocity": 100},
+            {"start": 0.52, "end": 1.5, "pitch": upper, "velocity": 100},
+        ]
+
+    def test_velocity_written_for_every_note(self, tmp_path):
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        self._write_stem(paths, upper_amp=0.8)
+        _write_notes(paths, self._octave_pair_notes(69, 81))
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert out["params"]["audio_evidence"] is True
+        assert len(out["notes"]) > 0
+        for n in out["notes"]:
+            assert isinstance(n["velocity"], int)
+            assert 0 <= n["velocity"] <= 127
+
+    def test_basic_pitch_source_keeps_native_velocities(self, tmp_path):
+        # basic-pitch velocities are model confidences — the quantity the
+        # velocity gates were originally tuned on — so a stem-backed run
+        # must NOT replace them with CQT energy proxies (the overtone pass
+        # still runs off the contexts). The pseudo-velocity for a full-
+        # amplitude 440 Hz claim would be near 127, so velocity 77
+        # surviving proves preservation.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        self._write_stem(paths, upper_amp=0.8)
+        paths.notes_json.write_text(
+            json.dumps({"notes": [{"start": 0.5, "end": 1.5, "pitch": 69, "velocity": 77}]})
+        )
+        assign_frets(paths, force=True, backend="basic_pitch")
+        out = json.loads(paths.frets_json.read_text())
+        assert out["params"]["audio_evidence"] is True
+        assert [n["velocity"] for n in out["notes"]] == [77]
+
+    def test_strict_overtone_dropped_and_recorded(self, tmp_path):
+        # E(81)/E(69) ≈ 0.035 < OCTAVE_ARTIFACT_RATIO → 81 is a phantom.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        self._write_stem(paths, upper_amp=0.05)
+        _write_notes(paths, self._octave_pair_notes(69, 81))
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert [n["pitch"] for n in out["notes"]] == [69]
+        assert len(out["overtone_artifacts"]) == 1
+        artifact = out["overtone_artifacts"][0]
+        assert artifact["pitch"] == 81
+        assert artifact["start"] == 0.52
+
+    def test_gray_zone_overtone_dropped_when_only_playable_high(self, tmp_path):
+        # E(81)/E(69) ≈ 0.25 — inside the gray zone — and A5 is only
+        # playable at fret 17, so it must still be dropped (the Angie
+        # t=828.4s flagship case).
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        self._write_stem(paths, upper_amp=0.35)
+        _write_notes(paths, self._octave_pair_notes(69, 81))
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert [n["pitch"] for n in out["notes"]] == [69]
+        assert len(out["overtone_artifacts"]) == 1
+        assert "fret" in out["overtone_artifacts"][0]["reason"]
+
+    def test_gray_zone_octave_kept_when_playable_low(self, tmp_path):
+        # Same gray-zone energy ratio as the dropped case above, but claimed
+        # as the pair (A3=57, A4=69) over a 220+440 Hz stem: the upper note
+        # is playable at fret 5 (G string), i.e. at or below
+        # _OCTAVE_GRAY_ZONE_MIN_FRET, so it's a genuine octave pair — kept.
+        import soundfile as sf
+
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        t = np.arange(int(self.SR * 2.0)) / self.SR
+        y = 0.5 * (np.sin(2 * np.pi * 220.0 * t) + 0.45 * np.sin(2 * np.pi * 440.0 * t))
+        paths.stems_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(paths.guitar_stem, y.astype(np.float32), self.SR)
+        _write_notes(paths, self._octave_pair_notes(57, 69))
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert sorted(n["pitch"] for n in out["notes"]) == [57, 69]
+        assert out["overtone_artifacts"] == []
+
+    def test_pseudo_velocities_revive_sympathetic_gate(self, tmp_path):
+        # A3 (220 Hz) at full amplitude plus an E4=64 partial 40 dB down:
+        # pseudo-velocities land around 127 vs 42 (ratio ~0.33, below
+        # _SYMPATHETIC_RATIO), so the quiet note must be dropped by the
+        # revived sympathetic gate. +7 semitones is no harmonic offset and
+        # 64 has no p-12 partner in the cluster, so neither the harmonic
+        # gate nor the octave pass can be the one dropping it — and
+        # overtone_artifacts stays empty to prove that.
+        import soundfile as sf
+
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        t = np.arange(int(self.SR * 2.0)) / self.SR
+        y = 0.5 * (np.sin(2 * np.pi * 220.0 * t) + 0.01 * np.sin(2 * np.pi * 329.63 * t))
+        paths.stems_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(paths.guitar_stem, y.astype(np.float32), self.SR)
+        _write_notes(
+            paths,
+            [
+                {"start": 0.5, "end": 1.5, "pitch": 57, "velocity": 100},
+                {"start": 0.52, "end": 1.5, "pitch": 64, "velocity": 100},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert [n["pitch"] for n in out["notes"]] == [57]
+        assert out["overtone_artifacts"] == []
+
+    def test_velocity_gate_does_not_undo_calibrated_octave_keep(self, tmp_path):
+        # Regression for the harmonic-overtone gate double-adjudicating +12
+        # pairs: a louder unrelated burst earlier in the window drags BOTH
+        # pair velocities down the dB scale, shrinking their velocity RATIO
+        # (measured: 36/59 = 0.61 < _HARMONIC_VELOCITY_RATIO) while the
+        # pair's CQT energy ratio stays in the calibrated gray zone
+        # (measured 0.283) with the upper note playable at fret 1 → the
+        # calibrated pass keeps it. Pre-fix, the velocity gate then deleted
+        # the upper note anyway; with the audio-evidence pass active, +12 is
+        # off-limits to the velocity gate and both notes must survive.
+        import soundfile as sf
+
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        t = np.arange(int(self.SR * 2.0)) / self.SR
+        y = np.zeros_like(t)
+        burst = (t >= 0.1) & (t < 0.7)
+        y[burst] += 0.9 * np.sin(2 * np.pi * 880.0 * t[burst])
+        pair = (t >= 1.0) & (t < 1.9)
+        y[pair] += 0.01 * (
+            np.sin(2 * np.pi * 174.61 * t[pair])  # F3 = MIDI 53
+            + 0.4 * np.sin(2 * np.pi * 349.23 * t[pair])  # F4 = MIDI 65
+        )
+        paths.stems_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(paths.guitar_stem, y.astype(np.float32), self.SR)
+        _write_notes(
+            paths,
+            [
+                {"start": 1.0, "end": 1.9, "pitch": 53, "velocity": 100},
+                {"start": 1.02, "end": 1.9, "pitch": 65, "velocity": 100},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert sorted(n["pitch"] for n in out["notes"]) == [53, 65]
+        assert out["overtone_artifacts"] == []
+
+    def test_window_chunking_and_boundary_straddling_cluster(self, tmp_path):
+        # An 82 s stem spans two evidence windows (80 s each). Notes land in
+        # window 0, in window 1, AND in a cluster straddling the boundary
+        # (onsets 79.98 + 80.03, gap 0.05 < ONSET_CLUSTER_GAP) — the
+        # straddling cluster is adjudicated from its FIRST onset's window,
+        # whose _EVIDENCE_WINDOW_PAD covers past the boundary. The stem is
+        # 220 Hz with a 440 Hz partial at 0.05 amplitude, so the claimed
+        # A4=69 over A3=57 is a strict phantom (E ratio ~0.035 < 0.20).
+        import soundfile as sf
+
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        t = np.arange(int(self.SR * 82.0)) / self.SR
+        y = 0.5 * (np.sin(2 * np.pi * 220.0 * t) + 0.05 * np.sin(2 * np.pi * 440.0 * t))
+        paths.stems_dir.mkdir(parents=True, exist_ok=True)
+        sf.write(paths.guitar_stem, y.astype(np.float32), self.SR)
+        _write_notes(
+            paths,
+            [
+                {"start": 1.0, "end": 1.5, "pitch": 57, "velocity": 100},
+                {"start": 79.98, "end": 80.5, "pitch": 57, "velocity": 100},
+                {"start": 80.03, "end": 80.5, "pitch": 69, "velocity": 100},
+                {"start": 81.0, "end": 81.5, "pitch": 57, "velocity": 100},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        # The phantom in the straddling cluster was dropped + recorded; the
+        # window-1 note got a measured velocity like everything else.
+        assert [n["pitch"] for n in out["notes"]] == [57, 57, 57]
+        assert len(out["overtone_artifacts"]) == 1
+        assert out["overtone_artifacts"][0]["pitch"] == 69
+        assert out["overtone_artifacts"][0]["start"] == 80.03
+        for n in out["notes"]:
+            assert isinstance(n["velocity"], int)
+            assert n["velocity"] > 0

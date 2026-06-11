@@ -18,15 +18,31 @@ pass (Phase 3.5) to disambiguate from frame imagery.
 The output ``frets.json`` records, for every note, the chosen (string, fret)
 plus an ``ambiguous`` flag, an ``alternatives`` list (other near-optimal
 shapes for the cluster), and the cluster ID.
+
+When the separated guitar stem exists, an *audio-evidence pass* runs before
+shape enumeration: per-note pseudo-velocities are derived from the stem's
+CQT (reviving every velocity-gated filter that MT3's constant velocity 100
+left dead), and probable phantom octave overtones are dropped per onset
+cluster via the calibrated salience ratio test (recorded under
+``overtone_artifacts`` so nothing vanishes silently). Without a stem the
+pass is skipped; the output then matches the pre-salience format except
+that ``params.audio_evidence: false`` records the skip (no per-note
+velocity fields, no ``overtone_artifacts`` key).
 """
 
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .paths import VideoPaths
+
+if TYPE_CHECKING:
+    from .salience import CQTContext
 
 # ---------------------------------------------------------------------------
 # Constants — standard tuning (low → high), reasonable fret/hand limits
@@ -76,10 +92,18 @@ _W_HAND_MOVE = 0.15
 _W_STRING_PRESERVE = -0.15  # bonus per note still on the same string
 
 # An assignment is "ambiguous" if the runner-up shape was within this delta.
-# 0.4 was way too generous and flagged ~70% of clusters; 0.12 picks out
-# only the genuinely close calls (a single fret/string disagreement at
-# similar position cost).
-_AMBIGUITY_MARGIN = 0.12
+# 0.12 was smaller than a single open-string bonus (|_W_OPEN_BONUS| = 0.8),
+# so any near-tie that traded an open string for a fretted position — exactly
+# the octave/string contests the vision pass exists to settle — could never
+# be flagged (5.5% of Angie's clusters, mostly trivia). Measured sweep on
+# cache/wS_i91qxQYM (post-salience pipeline, 2380 clusters):
+#   0.12 → 5.0%, 0.30 → 7.1%, 0.50 → 8.2%, 0.70 → 9.5%, 0.75 → 14.4%,
+#   0.80 → 24.9%, 1.00 → 35.4%
+# 0.75 captures open-vs-fretted trades where the fretted shape also holds a
+# small positional edge (deltas of 0.8 minus a few _W_FRET_POSITION terms)
+# and lands at 14.4% — inside the 10-20% target. 0.80 would additionally
+# flag every EXACT open-vs-fretted tie and floods to ~25%.
+_AMBIGUITY_MARGIN = 0.75
 
 # Idiomatic chord-shape bonus: when a cluster's pitches form a subset of a
 # known open-position chord template AND the candidate shape's (string, fret)
@@ -131,7 +155,12 @@ def _chord_pitch_classes(chord_name: str) -> frozenset[int] | None:
 
 # Velocity above which we KEEP an out-of-chord note (assume it's a melodic
 # passing tone or hammer-on the instructor played deliberately). Below this,
-# out-of-chord notes are treated as basic-pitch artifacts and dropped.
+# out-of-chord notes are treated as transcription artifacts and dropped.
+# The quantity depends on the source: basic-pitch notes carry the model's
+# confidence (0-127); stem-backed MT3 runs carry salience's CQT
+# pseudo-velocity (dB-linear energy proxy, 0-127). The same floor measures
+# fine for both — on Angie (MT3 + pseudo-velocities) it drops 126 notes,
+# only 4/588 (0.7%) and 0/52 inside the two chroma-verified-good windows.
 _CHORD_FILTER_VELOCITY_FLOOR = 55
 
 # Toleration window for "near a chord tone": a pitch one semitone away from
@@ -577,21 +606,63 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     _CHORD_TEMPLATES = _build_chord_templates_for_tuning(_ACTIVE_TUNING, tuning_label)
 
     notes = _dedupe_same_pitch_onsets(notes)
+
+    # Audio-evidence pass, part 1 (pseudo-velocities). When the separated
+    # guitar stem exists, derive an energy-proxy velocity for every note —
+    # MT3 emits constant velocity 100, which left every velocity gate below
+    # (_CHORD_FILTER_VELOCITY_FLOOR, _SYMPATHETIC_RATIO,
+    # _HARMONIC_VELOCITY_RATIO) and render.py's quiet-note floor dead.
+    # basic-pitch sources keep their native confidence-derived velocities
+    # (the quantity those gates' thresholds were originally tuned on); only
+    # the CQT contexts are built then, for the overtone pass below.
+    # No stem → contexts is None and everything behaves exactly as before.
+    evidence_contexts: dict[int, CQTContext] | None = None
+    if paths.guitar_stem.exists():
+        evidence_contexts = _attach_pseudo_velocities(
+            notes,
+            paths.guitar_stem,
+            overwrite_velocities=source == paths.notes_mt3_json,
+        )
+
     chord_spans: list[tuple[float, float, str]] = []
     if paths.structure_json.exists():
         chord_spans = _load_chord_spans(paths.structure_json)
         notes = _filter_by_chord_context(notes, chord_spans)
     clusters = _cluster_notes_by_onset(notes)
+
+    # Audio-evidence pass, part 2 (phantom octave overtones). Must run on
+    # onset clusters (the flag needs the p-12 partner in the same strum) and
+    # before shape enumeration so phantoms can't drag the Viterbi path up
+    # the neck. Dropped notes are recorded, not silently discarded.
+    overtone_artifacts: list[dict] = []
+    if evidence_contexts is not None:
+        notes, clusters, overtone_artifacts = _drop_overtone_artifacts(
+            notes, clusters, evidence_contexts
+        )
+
     notes, clusters = _filter_sympathetic_resonance(notes, clusters)
-    notes, clusters = _filter_harmonic_overtones(notes, clusters)
+    # When the audio-evidence pass ran, the calibrated CQT octave test above
+    # owns +12 adjudication — the velocity gate must not re-decide it (see
+    # _HARMONIC_OFFSETS_EVIDENCE).
+    notes, clusters = _filter_harmonic_overtones(
+        notes, clusters, skip_octave=evidence_contexts is not None
+    )
     cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
 
     # Drop clusters where no playable shape exists — these are pitches
     # outside guitar range or impossible-to-finger combinations. Annotate them.
+    # NOTE: cluster ids form ONE namespace — the enumeration index below is
+    # carried through to kept notes, cluster records AND unplayable_clusters
+    # (ids in clusters/notes are therefore sparse when anything is
+    # unplayable). render._apply_overrides and frames-for-clusters both look
+    # ids up by value, so gaps are harmless; renumbering kept clusters (the
+    # old behavior) made unplayable_clusters point at the WRONG clusters.
+    playable_ids: list[int] = []
     playable: list[tuple[list[int], list[Shape]]] = []
     unplayable_clusters: list[dict] = []
     for cidx, (cluster, shapes) in enumerate(zip(clusters, cluster_shapes, strict=True)):
         if shapes:
+            playable_ids.append(cidx)
             playable.append((cluster, shapes))
         else:
             unplayable_clusters.append(
@@ -608,37 +679,48 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
 
     # Build per-note output.
     note_records: list[dict] = []
-    cluster_id_of_note: dict[int, int] = {}
     cluster_records: list[dict] = []
-    for cidx_out, ((cluster, shapes), shape, is_ambig) in enumerate(
-        zip(playable, chosen, ambiguous_flags, strict=True)
+    for cid, (cluster, shapes), shape, is_ambig in zip(
+        playable_ids, playable, chosen, ambiguous_flags, strict=True
     ):
         assignment_by_note = {ni: (s, f) for ni, s, f in shape.assignments}
+        alternatives = _alternative_shapes(shapes, shape)
+        if is_ambig:
+            # Offer the runner-up octave reading to the vision pass — it can
+            # only fix what is listed as an alternative. Restricted to
+            # already-ambiguous clusters: octave-shifted shapes' costs are
+            # not comparable with the chosen shape's (lower pitches are
+            # intrinsically cheaper to play), so a cost margin can't gate
+            # them — flagging on their existence flooded 61% of Angie's
+            # clusters when tried.
+            octave_alt = _octave_alternative(notes, cluster, shape)
+            if octave_alt is not None:
+                alternatives.append(octave_alt)
         for note_local_idx, note_global_idx in enumerate(cluster):
-            cluster_id_of_note[note_global_idx] = cidx_out
             s, f = assignment_by_note[note_local_idx]
             n = notes[note_global_idx]
-            note_records.append(
-                {
-                    "note_index": note_global_idx,
-                    "start": n["start"],
-                    "end": n["end"],
-                    "pitch": n["pitch"],
-                    "string": s,  # 0..5, 0 = low E
-                    "tab_string": NUM_STRINGS - s,  # 1..6, 1 = low E? — no, 6 = low E
-                    "fret": f,
-                    "cluster_id": cidx_out,
-                    "ambiguous": is_ambig,
-                }
-            )
+            record = {
+                "note_index": note_global_idx,
+                "start": n["start"],
+                "end": n["end"],
+                "pitch": n["pitch"],
+                "string": s,  # 0..5, 0 = low E
+                "tab_string": NUM_STRINGS - s,  # 1..6, 1 = low E? — no, 6 = low E
+                "fret": f,
+                "cluster_id": cid,
+                "ambiguous": is_ambig,
+            }
+            if evidence_contexts is not None:
+                record["velocity"] = n["velocity"]
+            note_records.append(record)
         cluster_records.append(
             {
-                "cluster_id": cidx_out,
+                "cluster_id": cid,
                 "onset": min(notes[i]["start"] for i in cluster),
                 "note_indices": cluster,
                 "best_shape_cost": shape.cost,
                 "ambiguous": is_ambig,
-                "alternatives": _alternative_shapes(shapes, shape),
+                "alternatives": alternatives,
             }
         )
 
@@ -654,12 +736,194 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             "onset_cluster_gap": ONSET_CLUSTER_GAP,
             "max_cluster_duration": MAX_CLUSTER_DURATION,
             "ambiguity_margin": _AMBIGUITY_MARGIN,
+            "audio_evidence": evidence_contexts is not None,
         },
         "clusters": cluster_records,
         "notes": note_records,
     }
+    if evidence_contexts is not None:
+        out["overtone_artifacts"] = overtone_artifacts
     paths.frets_json.write_text(json.dumps(out, indent=2))
     return paths
+
+
+# ---------------------------------------------------------------------------
+# Audio-evidence pass (salience): pseudo-velocities + phantom overtones
+# ---------------------------------------------------------------------------
+
+# Chunk size for CQT contexts over the note timeline. The CQT itself is
+# cheap (~0.1 s per 80 s window at salience's settings); decoding/resampling
+# the stem slice dominates (~2.5 s per window), so windows are sized to keep
+# the per-window CQT array small while amortizing the audio I/O. Windows
+# with no note onsets (talking segments) are skipped entirely.
+_EVIDENCE_WINDOW_SECONDS = 80.0
+
+# Tail padding past each window boundary so every onset in the window has
+# its full post-onset analysis frames (salience reads up to onset + 200 ms),
+# and so an onset cluster that straddles a boundary (max span
+# MAX_CLUSTER_DURATION = 0.2 s) is fully covered by its first onset's window.
+_EVIDENCE_WINDOW_PAD = 1.0
+
+# Gray-zone octave artifacts. salience.OCTAVE_ARTIFACT_RATIO (0.20) is
+# deliberately precision-first and misses louder phantom overtones: Angie's
+# t=828.4-829.1 s phantom A5=81 measures E(81)/E(69) = 0.34-0.52, inside the
+# genuine-octave-pair distribution (p25 0.54, median 0.67 on the verified
+# windows), and its salience percentile (0.86-0.91) is equally inseparable
+# (genuine uppers: p25 0.87, median 0.91) — overtone energy IS real energy
+# at that bin, so no per-onset audio measure separates the two. What does
+# separate them is playability: every genuine octave pair in the calibration
+# set has its upper note in open position (min fret <= 3), while the phantom
+# A5 is only reachable at fret 17 and drags the whole cluster to 14-17. So
+# in the ratio gray zone [0.20, 0.55) we additionally require the upper note
+# to be FRETTABLE LOW: notes whose lowest playable fret exceeds
+# _OCTAVE_GRAY_ZONE_MIN_FRET are dropped as artifacts. The residual risk —
+# a genuinely played octave double-stop above fret 7 — is rare in acoustic
+# tutorials and loses only the doubled upper note, not the position.
+_OCTAVE_GRAY_ZONE_RATIO = 0.55
+_OCTAVE_GRAY_ZONE_MIN_FRET = 7
+
+
+def _evidence_window_index(onset: float) -> int:
+    return int(onset // _EVIDENCE_WINDOW_SECONDS)
+
+
+def _attach_pseudo_velocities(
+    notes: list[dict], stem_path: Path, overwrite_velocities: bool = True
+) -> dict[int, CQTContext]:
+    """Build per-window CQT contexts over the note timeline and (when
+    ``overwrite_velocities``) write a pseudo-velocity (0-127 energy proxy)
+    into every note dict in place.
+
+    ``overwrite_velocities=False`` is for basic-pitch sources: their native
+    velocities are model confidences that already carry information for the
+    velocity gates (which were originally tuned on that quantity), so they
+    must not be replaced by the CQT energy proxy — only the contexts are
+    needed, for the overtone-artifact pass.
+
+    Returns the contexts keyed by window index so the overtone-artifact pass
+    can reuse them — the CQT is the dominant analysis cost and must run
+    exactly once per window.
+    """
+    # Deferred import: salience pulls in librosa (~7 s), which no-stem runs
+    # and the unit tests shouldn't pay for.
+    from . import salience
+
+    by_window: dict[int, list[int]] = defaultdict(list)
+    for i, n in enumerate(notes):
+        by_window[_evidence_window_index(n["start"])].append(i)
+
+    contexts: dict[int, CQTContext] = {}
+    for k in sorted(by_window):
+        window_start = k * _EVIDENCE_WINDOW_SECONDS
+        window_end = (k + 1) * _EVIDENCE_WINDOW_SECONDS + _EVIDENCE_WINDOW_PAD
+        y, sr = salience.load_stem_window(stem_path, window_start, window_end)
+        ctx = salience.compute_cqt_context(y, sr, window_start)
+        contexts[k] = ctx
+        if not overwrite_velocities:
+            continue
+        idxs = by_window[k]
+        events = [(notes[i]["start"], notes[i]["pitch"]) for i in idxs]
+        velocities = salience.pseudo_velocity(events, y, sr, window_start, ctx=ctx)
+        for i, vel in zip(idxs, velocities, strict=True):
+            notes[i]["velocity"] = vel
+    return contexts
+
+
+def _min_playable_fret(pitch: int) -> int | None:
+    """Lowest fret at which ``pitch`` is playable under the active tuning,
+    or None when the pitch is out of range on every string."""
+    frets = [
+        pitch - open_pitch for open_pitch in _ACTIVE_TUNING if 0 <= pitch - open_pitch <= MAX_FRET
+    ]
+    return min(frets) if frets else None
+
+
+def _drop_overtone_artifacts(
+    notes: list[dict],
+    clusters: list[list[int]],
+    contexts: dict[int, CQTContext],
+) -> tuple[list[dict], list[list[int]], list[dict]]:
+    """Drop notes flagged as phantom octave overtones.
+
+    Two tiers, both requiring a sounding p-12 partner in the same cluster:
+    1. the calibrated salience ratio test (salience.OCTAVE_ARTIFACT_RATIO);
+    2. the gray zone [OCTAVE_ARTIFACT_RATIO, _OCTAVE_GRAY_ZONE_RATIO) where
+       ratio alone cannot separate phantom from genuine — there the note is
+       dropped only when it is also unplayable below
+       _OCTAVE_GRAY_ZONE_MIN_FRET (see the constants' comment).
+
+    Returns the filtered (notes, clusters) plus a record of every dropped
+    note so frets.json can report them instead of silently losing notes."""
+    from . import salience
+
+    keep_mask = [True] * len(notes)
+    artifacts: list[dict] = []
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue  # no same-strum partner to be an overtone of
+        events = [(notes[i]["start"], notes[i]["pitch"]) for i in cluster]
+        # Cluster indices are onset-ordered; the first onset's window covers
+        # the whole cluster thanks to _EVIDENCE_WINDOW_PAD > MAX_CLUSTER_DURATION.
+        ctx = contexts.get(_evidence_window_index(events[0][0]))
+        if ctx is None:
+            continue
+        strict_flags = salience.octave_artifact_flags(events, ctx)
+        loose_flags = salience.octave_artifact_flags(
+            events, ctx, ratio_threshold=_OCTAVE_GRAY_ZONE_RATIO
+        )
+        for i, strict, loose in zip(cluster, strict_flags, loose_flags, strict=True):
+            if strict:
+                reason = "CQT energy consistent with overtone of the octave below."
+            elif loose:
+                min_fret = _min_playable_fret(notes[i]["pitch"])
+                if min_fret is None or min_fret <= _OCTAVE_GRAY_ZONE_MIN_FRET:
+                    continue
+                reason = (
+                    "Gray-zone overtone ratio AND only playable above fret "
+                    f"{_OCTAVE_GRAY_ZONE_MIN_FRET}."
+                )
+            else:
+                continue
+            keep_mask[i] = False
+            artifacts.append(
+                {
+                    "start": notes[i]["start"],
+                    "end": notes[i]["end"],
+                    "pitch": notes[i]["pitch"],
+                    "octave_below": notes[i]["pitch"] - 12,
+                    "reason": reason,
+                }
+            )
+    notes, clusters = _remap_filtered_notes(notes, clusters, keep_mask)
+    return notes, clusters, artifacts
+
+
+# ---------------------------------------------------------------------------
+# Post-clustering filters — shared remap helper
+# ---------------------------------------------------------------------------
+
+
+def _remap_filtered_notes(
+    notes: list[dict], clusters: list[list[int]], keep_mask: list[bool]
+) -> tuple[list[dict], list[list[int]]]:
+    """Rebuild the notes list + cluster index lists after dropping the notes
+    whose ``keep_mask`` entry is False. Cluster groupings are preserved;
+    clusters emptied entirely disappear. No-op (same objects) when nothing
+    was dropped."""
+    if all(keep_mask):
+        return notes, clusters
+    old_to_new: dict[int, int] = {}
+    filtered_notes: list[dict] = []
+    for old_idx, note in enumerate(notes):
+        if keep_mask[old_idx]:
+            old_to_new[old_idx] = len(filtered_notes)
+            filtered_notes.append(note)
+    new_clusters: list[list[int]] = []
+    for cluster in clusters:
+        new_cluster = [old_to_new[i] for i in cluster if i in old_to_new]
+        if new_cluster:
+            new_clusters.append(new_cluster)
+    return filtered_notes, new_clusters
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +938,20 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
 #   +24 = two octaves (4th harmonic)
 _HARMONIC_OFFSETS = (12, 19, 24)
 
+# Offsets considered when the audio-evidence pass already ran. +12 is
+# EXCLUDED then: _drop_overtone_artifacts owns octave adjudication with a
+# CALIBRATED energy-ratio test, whereas this gate's velocity-ratio cut
+# operates in the log-dB pseudo-velocity domain — the effective ENERGY
+# threshold it implies varies with the source note's absolute level (~0.20
+# at source velocity 100, ~0.38 at velocity 60), it has no playability
+# guard, and it records nothing in overtone_artifacts. Measured on Angie it
+# silently undid calibrated keep decisions: 19 deletions (12 at +12), e.g.
+# the documented-genuine F 53/65 octave pair at t=42.16 s in the
+# chroma-verified intro (velocities 68 vs 104 → ratio 0.654 < 0.7) that the
+# gray-zone pass had correctly kept. +19/+24 stay here: salience's octave
+# test does not cover those harmonics.
+_HARMONIC_OFFSETS_EVIDENCE = (19, 24)
+
 # A note is considered a harmonic of a louder same-cluster note only if its
 # velocity is below this fraction of the source's velocity. The first
 # harmonic is typically much quieter than the struck fundamental.
@@ -681,7 +959,7 @@ _HARMONIC_VELOCITY_RATIO = 0.7
 
 
 def _filter_harmonic_overtones(
-    notes: list[dict], clusters: list[list[int]]
+    notes: list[dict], clusters: list[list[int]], skip_octave: bool = False
 ) -> tuple[list[dict], list[list[int]]]:
     """Drop notes within a cluster that look like overtones of a louder note
     in the same cluster.
@@ -691,10 +969,16 @@ def _filter_harmonic_overtones(
     semitones above a louder note's pitch AND whose velocity is below
     ``_HARMONIC_VELOCITY_RATIO`` of that louder note's velocity.
 
+    With ``skip_octave`` (set when the audio-evidence pass ran) only
+    +19/+24 are considered — the calibrated CQT octave test owns +12 then
+    (see _HARMONIC_OFFSETS_EVIDENCE).
+
     Skipped for single-note clusters (no peer to compare against).
     """
     if not clusters:
         return notes, clusters
+
+    offsets = _HARMONIC_OFFSETS_EVIDENCE if skip_octave else _HARMONIC_OFFSETS
 
     keep_mask = [True] * len(notes)
     for cluster in clusters:
@@ -718,39 +1002,28 @@ def _filter_harmonic_overtones(
                 if source_vel <= 0:
                     continue
                 interval = candidate["pitch"] - source["pitch"]
-                if interval in _HARMONIC_OFFSETS:
+                if interval in offsets:
                     ratio = candidate_vel / source_vel
                     if ratio < _HARMONIC_VELOCITY_RATIO:
                         keep_mask[candidate_idx] = False
                         break
 
-    if all(keep_mask):
-        return notes, clusters
-
-    old_to_new: dict[int, int] = {}
-    filtered_notes: list[dict] = []
-    for old_idx, note in enumerate(notes):
-        if keep_mask[old_idx]:
-            old_to_new[old_idx] = len(filtered_notes)
-            filtered_notes.append(note)
-    new_clusters = []
-    for cluster in clusters:
-        new_cluster = [old_to_new[i] for i in cluster if i in old_to_new]
-        if new_cluster:
-            new_clusters.append(new_cluster)
-    return filtered_notes, new_clusters
+    return _remap_filtered_notes(notes, clusters, keep_mask)
 
 
 # ---------------------------------------------------------------------------
 # Post-clustering: sympathetic-resonance filter
 # ---------------------------------------------------------------------------
 
-# basic-pitch's "velocity" field is really the model's confidence score on a
-# 0..127 scale, so within a cluster we treat substantially-lower-confidence
-# notes as either sympathetic resonance or transcription artifacts. 0.50 of
-# the peak confidence is a reasonable cutoff — within-cluster velocity
+# Within a cluster, notes whose velocity sits far below the cluster peak are
+# treated as sympathetic resonance or transcription artifacts. The velocity
+# quantity depends on the source: basic-pitch's "velocity" field is really
+# the model's confidence score on a 0..127 scale (within-cluster confidence
 # ratios cluster tightly around 0.62-0.83, so notes <50% are the genuine
-# outliers.
+# outliers); stem-backed MT3 runs carry salience's CQT pseudo-velocity
+# (dB-linear energy proxy) instead, where the same 0.50 cutoff was what
+# dropped the non-B3 phantom members of the Angie t=903.2 s flagship
+# open-E7 cluster.
 _SYMPATHETIC_RATIO = 0.50
 
 
@@ -786,23 +1059,7 @@ def _filter_sympathetic_resonance(
             if notes[idx].get("velocity", 0) < floor:
                 keep_mask[idx] = False
 
-    if all(keep_mask):
-        return notes, clusters
-
-    # Remap to filtered note list while preserving cluster groupings.
-    old_to_new: dict[int, int] = {}
-    filtered_notes: list[dict] = []
-    for old_idx, note in enumerate(notes):
-        if keep_mask[old_idx]:
-            old_to_new[old_idx] = len(filtered_notes)
-            filtered_notes.append(note)
-
-    new_clusters: list[list[int]] = []
-    for cluster in clusters:
-        new_cluster = [old_to_new[i] for i in cluster if i in old_to_new]
-        if new_cluster:
-            new_clusters.append(new_cluster)
-    return filtered_notes, new_clusters
+    return _remap_filtered_notes(notes, clusters, keep_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +1181,14 @@ def _filter_by_chord_context(
 # single note. basic-pitch occasionally splits one struck note into two
 # overlapping detections; including both in a cluster forces them onto
 # different strings and breaks chord-template matching.
-_SAME_PITCH_DEDUPE_WINDOW = 0.20
+#
+# 0.20 deleted real re-strums: 16th notes are 0.20s apart at 75 bpm and
+# 0.125s at 120 bpm, so any 16th-note figure at practical tempos lost every
+# second same-pitch hit. 0.08 matches ONSET_CLUSTER_GAP — two detections
+# farther apart than the cluster gap land in *different* onset clusters and
+# are therefore genuine re-articulations, while split detections of one
+# pluck land inside a single cluster window.
+_SAME_PITCH_DEDUPE_WINDOW = 0.08
 
 
 def _dedupe_same_pitch_onsets(notes: list[dict]) -> list[dict]:
@@ -1194,6 +1458,78 @@ def _flag_ambiguous(
         runner_up = min(diff_costs)
         flags.append((runner_up - pick.cost) <= _AMBIGUITY_MARGIN)
     return flags
+
+
+# Octave substitutions tried per note when searching for an octave
+# alternative: down an octave (MT3's phantom-overtone direction) and up.
+_OCTAVE_ALTERNATIVE_DELTAS = (-12, 12)
+
+
+def _octave_alternative(notes: list[dict], cluster: list[int], chosen: Shape) -> dict | None:
+    """Best shape obtainable by transposing ONE cluster note by an octave.
+
+    The regular alternatives list only re-fingerings the *claimed* pitches,
+    so when MT3 transcribed the wrong octave the vision pass had nothing to
+    pick — it can only fix what is offered. The returned record matches the
+    _alternative_shapes() entry format plus an ``octave_shift`` field naming
+    the transposed note. ``octave_shift.local_note_index`` is the
+    CLUSTER-LOCAL index — the same namespace as frets.overrides.json's
+    new_assignments[].note_index (per-cluster note order), NOT the global
+    notes[]-list index that note records carry as ``note_index``.
+
+    CAUTION — the current overrides workflow cannot apply this alternative
+    losslessly: frets.overrides.json entries carry only string/fret, so
+    pushing these assignments through render._apply_overrides leaves the
+    note's recorded ``pitch`` at the transcribed (wrong) octave, breaking
+    the pitch == tuning[string] + fret invariant. Downstream pitch-keyed
+    consumers then read the stale value: render._apply_verified_chord_shapes
+    (which runs AFTER _apply_overrides and matches on int(pitch)) can
+    silently re-override the correction, and cross-instance voting keys on
+    (chord, pitch). Display-only rendering (string/fret) is unaffected.
+    Before the vision pass starts consuming ``octave_shift``, the override
+    schema needs an optional corrected ``pitch`` field, applied in
+    render._apply_overrides.
+
+    NOTE: the reported cost/delta come from the same shape-cost function but
+    describe a DIFFERENT pitch set — lower octaves are intrinsically cheaper
+    (more open strings), so the delta is informative context for the vision
+    pass, not a like-for-like ranking against the chosen shape.
+    """
+    pitches = [notes[i]["pitch"] for i in cluster]
+    pitch_set = set(pitches)
+    best: tuple[Shape, int, int] | None = None  # (shape, local note idx, delta)
+    for local_idx in range(len(pitches)):
+        for delta in _OCTAVE_ALTERNATIVE_DELTAS:
+            shifted_pitch = pitches[local_idx] + delta
+            if shifted_pitch in pitch_set:
+                # Would duplicate an existing cluster pitch — that contest is
+                # "phantom overtone or not", which the audio-evidence pass
+                # already adjudicates; a unison double-stop isn't a credible
+                # alternative reading.
+                continue
+            shifted = [{"pitch": p} for p in pitches]
+            shifted[local_idx] = {"pitch": shifted_pitch}
+            shapes = _enumerate_shapes(shifted, list(range(len(shifted))))
+            if not shapes:
+                continue
+            candidate = shapes[0]  # already sorted by cost
+            if best is None or candidate.cost < best[0].cost:
+                best = (candidate, local_idx, delta)
+    if best is None:
+        return None
+    shape, local_idx, delta = best
+    return {
+        "cost": round(shape.cost, 4),
+        "delta_vs_chosen": round(shape.cost - chosen.cost, 4),
+        "assignments": [{"string": s, "fret": f} for _, s, f in shape.assignments],
+        "octave_shift": {
+            # Cluster-local (per-cluster note order), matching the overrides
+            # schema — NOT the global note_index of note records.
+            "local_note_index": local_idx,
+            "pitch_delta": delta,
+            "new_pitch": pitches[local_idx] + delta,
+        },
+    }
 
 
 def _alternative_shapes(shapes: list[Shape], chosen: Shape, k: int = 3) -> list[dict]:

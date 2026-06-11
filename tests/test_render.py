@@ -11,6 +11,7 @@ from migs_tab.render import (
     _DEFAULT_TAB_STRING_LETTERS,
     TuningInfo,
     _apply_overrides,
+    _apply_verified_chord_shapes,
     _build_cross_instance_support,
     _filter_noise,
     _format_time,
@@ -21,6 +22,7 @@ from migs_tab.render import (
     _refine_tempo_octave,
     _render_section_tab,
     _sections_from_structure,
+    _slot_winner,
     _subdivisions_from_beats,
     _tab_string_letters_for_tuning,
     _uniform_beat_grid,
@@ -117,13 +119,42 @@ class TestSectionsFromStructure:
 
 
 class TestFilterNoise:
-    def test_drops_very_short(self):
+    def test_drops_short_and_weak(self):
+        # Short notes die only when ALSO weak (velocity < 55).
         notes = [
-            {"start": 0.0, "end": 0.05, "pitch": 60, "velocity": 80},  # too short
+            {"start": 0.0, "end": 0.05, "pitch": 60, "velocity": 40},  # short + weak
             {"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 80},
         ]
         result = _filter_noise(notes)
         assert len(result) == 1
+
+    def test_short_but_loud_staccato_stab_survives(self):
+        # LBTD regression: the recovered E-chord stabs are 0.04-0.07s with
+        # pseudo-velocities 79-111. A bare duration gate deleted all 12 and
+        # the section vanished from the tab. Short + strong must survive.
+        notes = [
+            {"start": 156.61, "end": 156.66, "pitch": 52, "velocity": 105},
+            {"start": 156.62, "end": 156.67, "pitch": 64, "velocity": 80},
+            {"start": 156.63, "end": 156.67, "pitch": 59, "velocity": 79},
+        ]
+        result = _filter_noise(notes)
+        assert len(result) == 3
+
+    def test_short_with_missing_velocity_drops(self):
+        # No velocity recorded (older frets.json / transient-prone
+        # basic-pitch source) → strength unverifiable → conservative drop.
+        notes = [
+            {"start": 0.0, "end": 0.05, "pitch": 60},
+            {"start": 1.0, "end": 1.5, "pitch": 60},
+        ]
+        result = _filter_noise(notes)
+        assert len(result) == 1
+        assert result[0]["start"] == 1.0
+
+    def test_short_at_threshold_survives(self):
+        # velocity exactly 55 is NOT weak (gate is `< 55`).
+        notes = [{"start": 0.0, "end": 0.05, "pitch": 60, "velocity": 55}]
+        assert len(_filter_noise(notes)) == 1
 
     def test_drops_low_velocity(self):
         notes = [
@@ -406,7 +437,7 @@ class TestBuildCrossInstanceSupport:
         assert result["intro"][("Am", 57)] == 2
 
 
-def _note(start, end, pitch, string, fret, cluster_id):
+def _note(start, end, pitch, string, fret, cluster_id, **extra):
     return {
         "note_index": 0,
         "start": start,
@@ -416,7 +447,233 @@ def _note(start, end, pitch, string, fret, cluster_id):
         "fret": fret,
         "cluster_id": cluster_id,
         "ambiguous": False,
+        **extra,
     }
+
+
+def _standard_tuning() -> TuningInfo:
+    return TuningInfo(
+        label="Standard",
+        capo=0,
+        strings_midi=[40, 45, 50, 55, 59, 64],
+        source="test",
+        confidence=1.0,
+        string_letters=list(_DEFAULT_TAB_STRING_LETTERS),
+    )
+
+
+# Mirrors the real Angie chord-shapes-verified.json Am entry: a cowboy Am
+# voicing that ALSO carries the fret-5 A4 on the high-e string, i.e. two
+# entries on string 5 (midi 64 → open, midi 69 → fret 5).
+_AM_VERIFIED = {
+    "verified": {
+        "Am": {
+            "voicing": [
+                {"midi_pitch": 45, "string": 1, "fret": 0},
+                {"midi_pitch": 52, "string": 2, "fret": 2},
+                {"midi_pitch": 57, "string": 3, "fret": 2},
+                {"midi_pitch": 60, "string": 4, "fret": 1},
+                {"midi_pitch": 64, "string": 5, "fret": 0},
+                {"midi_pitch": 69, "string": 5, "fret": 5},
+            ],
+            "applies_to": "all_spans",
+        }
+    }
+}
+
+_AM_SPAN = [(820.0, 845.0, "Am")]
+
+
+class TestVerifiedShapeStrumGating:
+    """A verified voicing may only relocate notes inside a strummed
+    instance of the chord (>= 3 distinct voicing pitches simultaneous, or
+    the whole voicing for dyads). Melody/double-stop clusters in a chord
+    span are exempt — the override used to hijack them (Angie's fret-5
+    double-stop was forced onto open high-e, then collision-dropped)."""
+
+    def test_angie_double_stop_is_exempt(self):
+        # The exact flagship failure: A4(69) on e-5 over E4(64) on B-5 at
+        # t≈828.4s inside an Am span. Only 2 voicing pitches sound → NOT a
+        # strum → both notes keep the fret algorithm's assignment.
+        notes = [
+            _note(828.42, 828.76, 69, 5, 5, 1123, velocity=98),
+            _note(828.45, 828.73, 64, 4, 5, 1123, velocity=109),
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        assert (result[0]["string"], result[0]["fret"]) == (5, 5)
+        assert (result[1]["string"], result[1]["fret"]) == (4, 5)
+        assert all("overridden_by" not in n for n in result)
+
+    def test_genuine_five_note_strum_is_remapped(self):
+        # A full Am strum (5 voicing pitches at once) inside the span must
+        # still be pulled onto the verified voicing.
+        notes = [
+            _note(830.0, 831.0, 45, 0, 5, 200),  # algorithm guessed E-string 5
+            _note(830.01, 831.0, 52, 1, 7, 200),
+            _note(830.02, 831.0, 57, 2, 7, 200),
+            _note(830.03, 831.0, 60, 3, 5, 200),
+            _note(830.04, 831.0, 64, 4, 5, 200),
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        assert got == {45: (1, 0), 52: (2, 2), 57: (3, 2), 60: (4, 1), 64: (5, 0)}
+        assert all(n["overridden_by"] == "verified-shape:Am" for n in result)
+
+    def test_same_string_targets_within_cluster_are_not_fused(self):
+        # A strum cluster containing BOTH midi 64 and 69: the voicing maps
+        # both onto string 5, which one strum cannot do — the conflicting
+        # pair keeps the algorithm's assignment, the rest is remapped.
+        notes = [
+            _note(830.0, 831.0, 45, 0, 5, 300),
+            _note(830.01, 831.0, 52, 1, 7, 300),
+            _note(830.02, 831.0, 57, 2, 7, 300),
+            _note(830.03, 831.0, 64, 4, 5, 300),
+            _note(830.04, 831.0, 69, 5, 5, 300),
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        assert got[45] == (1, 0)
+        assert got[52] == (2, 2)
+        assert got[57] == (3, 2)
+        # The string-5 collision pair is left untouched.
+        assert got[64] == (4, 5)
+        assert got[69] == (5, 5)
+
+    def test_relocation_onto_unmoved_cluster_mate_is_cancelled(self):
+        # The Angie cluster-119 failure shape: the voicing relocates a
+        # note onto a string that an UNMOVED cluster-mate (a stray
+        # non-voicing pitch) already occupies. The old guard only caught
+        # proposal-vs-proposal contests, so the relocated note collided
+        # with the unmoved one and _slot_winner silently dropped a real
+        # sounded note. The contested remap must be cancelled; the
+        # uncontested remaps still apply.
+        notes = [
+            _note(830.0, 831.0, 45, 0, 5, 500),  # proposes string 1 — contested
+            _note(830.01, 831.0, 52, 2, 2, 500),  # already at the verified target
+            _note(830.02, 831.0, 57, 3, 2, 500),  # already at the verified target
+            _note(830.03, 831.0, 71, 1, 4, 500),  # stray B4, UNMOVED, sits on string 1
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        # 45 keeps the algorithm's collision-free assignment instead of
+        # being fused onto the stray's string.
+        assert got[45] == (0, 5)
+        assert got[52] == (2, 2)
+        assert got[57] == (3, 2)
+        assert got[71] == (1, 4)
+        by_pitch = {n["pitch"]: n for n in result}
+        assert "overridden_by" not in by_pitch[45]
+        assert "overridden_by" not in by_pitch[71]
+        # No two cluster notes share a string in the final layout.
+        strings = [n["string"] for n in result]
+        assert len(strings) == len(set(strings))
+
+    def test_cancelled_remap_revert_cascades_to_fixpoint(self):
+        # Cancelling a contested remap reverts that note to its
+        # algorithm string, which can newly contest ANOTHER remap's
+        # target — the guard must chase the chain to a fixpoint:
+        #   71 (unmoved, string 3) contests 57's remap → 57 reverts to
+        #   string 2, contesting 52's remap → 52 reverts to string 1,
+        #   contesting 45's remap → 45 reverts to string 0 (free).
+        notes = [
+            _note(830.0, 831.0, 45, 0, 5, 501),
+            _note(830.01, 831.0, 52, 1, 7, 501),
+            _note(830.02, 831.0, 57, 2, 7, 501),
+            _note(830.03, 831.0, 71, 3, 4, 501),  # stray, on 57's target string
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        assert got == {45: (0, 5), 52: (1, 7), 57: (2, 7), 71: (3, 4)}
+        assert all("overridden_by" not in n for n in result)
+
+    def test_strum_with_extra_non_voicing_pitch_still_qualifies(self):
+        # 3 distinct voicing pitches + 1 stray pitch: the members are
+        # remapped, the stray keeps its assignment.
+        notes = [
+            _note(830.0, 831.0, 45, 0, 5, 400),
+            _note(830.01, 831.0, 52, 1, 7, 400),
+            _note(830.02, 831.0, 57, 2, 7, 400),
+            _note(830.03, 831.0, 71, 5, 7, 400),  # B4 — not in the Am voicing
+        ]
+        result = _apply_verified_chord_shapes(notes, _AM_SPAN, _AM_VERIFIED, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        assert got == {45: (1, 0), 52: (2, 2), 57: (3, 2), 71: (5, 7)}
+
+    def test_dyad_voicing_requires_all_pitches(self):
+        # For a 2-pitch (power-chord) voicing the whole voicing must sound.
+        verified = {
+            "verified": {
+                "E5": {
+                    "voicing": [
+                        {"midi_pitch": 40, "string": 0, "fret": 0},
+                        {"midi_pitch": 47, "string": 1, "fret": 2},
+                    ],
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        spans = [(0.0, 10.0, "E5")]
+        # Lone E2 inside the span: melody, not the power chord → exempt.
+        solo = [_note(1.0, 2.0, 40, 0, 12, 0)]
+        result = _apply_verified_chord_shapes(solo, spans, verified, _standard_tuning())
+        assert (result[0]["string"], result[0]["fret"]) == (0, 12)
+        # Both pitches together → genuine power chord → remapped.
+        both = [
+            _note(3.0, 4.0, 40, 0, 12, 1),
+            _note(3.02, 4.0, 47, 1, 14, 1),
+        ]
+        result = _apply_verified_chord_shapes(both, spans, verified, _standard_tuning())
+        got = {n["pitch"]: (n["string"], n["fret"]) for n in result}
+        assert got == {40: (0, 0), 47: (1, 2)}
+
+
+class TestSlotWinner:
+    """Same-string same-slot keep-rule: prefer (1) the note NOT relocated
+    by a chord-shape override, then (2) higher velocity, then (3) earlier
+    onset."""
+
+    def test_prefers_note_not_relocated_by_override(self):
+        relocated = _note(0.95, 2.0, 64, 5, 0, 0, overridden_by="verified-shape:Am")
+        original = _note(1.02, 1.3, 69, 5, 5, 1)
+        kept, dropped = _slot_winner(relocated, original)
+        assert kept is original
+        assert dropped is relocated
+
+    def test_prefers_higher_velocity(self):
+        quiet = _note(0.95, 2.0, 64, 5, 0, 0, velocity=60)
+        loud = _note(1.02, 1.3, 67, 5, 3, 1, velocity=100)
+        kept, dropped = _slot_winner(quiet, loud)
+        assert kept is loud
+
+    def test_falls_back_to_earlier_onset(self):
+        first = _note(0.95, 2.0, 64, 5, 0, 0, velocity=90)
+        second = _note(1.02, 1.3, 67, 5, 3, 1, velocity=90)
+        kept, _ = _slot_winner(first, second)
+        assert kept is first
+
+    def test_override_preference_beats_velocity(self):
+        loud_relocated = _note(0.95, 2.0, 64, 5, 0, 0, velocity=120, overridden_by="x")
+        quiet_original = _note(1.02, 1.3, 67, 5, 3, 1, velocity=60)
+        kept, _ = _slot_winner(loud_relocated, quiet_original)
+        assert kept is quiet_original
+
+    def test_dropped_relocated_note_is_footnoted_with_tag(self):
+        # Through _render_section_tab: the relocated open-string note loses
+        # and the footnote says so.
+        notes = [
+            _note(0.95, 2.0, 64, 5, 0, 0, overridden_by="verified-shape:Am"),
+            _note(1.02, 1.3, 69, 5, 5, 1),
+        ]
+        tab, collisions, layout_notes = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0]
+        )
+        assert collisions == 1
+        assert len(layout_notes) == 1
+        assert "kept fret 5" in layout_notes[0]
+        assert "dropped fret 0" in layout_notes[0]
+        assert "relocated by a verified-shape override" in layout_notes[0]
+        e_line = next(line for line in tab.splitlines() if line.lstrip().startswith("e|"))
+        assert "5" in e_line
 
 
 class TestSlotCollisions:

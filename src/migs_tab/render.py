@@ -71,8 +71,20 @@ _SKIP_LABELS = {"closing_remarks"}
 # about every pitch it hears, including sympathetic resonance and short
 # transients — these would clutter the tab without representing intentional
 # notes the player meant to land.
-_MIN_NOTE_DURATION = 0.08  # drop notes shorter than this (~ a single hop)
+_MIN_NOTE_DURATION = 0.08  # "short" cutoff (~ a single hop)
 _MIN_NOTE_VELOCITY = 35  # drop notes quieter than this on the 0..127 scale
+# A short note is dropped only when it is ALSO weak — real staccato stabs
+# are short but loud. Threshold justified against the two flagship songs:
+# LBTD's 12 recovered E-chord stabs (MT3 durations 0.04-0.07s) carry CQT
+# pseudo-velocities 79-111 and must survive; across both songs the
+# sub-0.08s velocity distribution has its median at 83-84 with a thin
+# transient-noise tail below ~55 (Angie: 72/584 short notes below 55;
+# LBTD: 9/125, measured on the wave-3 final frets.json revisions).
+# Notes with NO velocity at all (older frets.json, or a
+# transient-prone basic-pitch backend without the salience integration)
+# stay on the conservative old behavior: short ⇒ dropped, because their
+# strength cannot be verified.
+_SHORT_NOTE_MIN_VELOCITY = 55
 # Duplicate-onset suppression: same-pitch onsets within this window are
 # re-detections of one pluck; the louder (then longer) of the pair is kept.
 # Onset distance is the ONLY criterion — the old sustain filter (drop any
@@ -96,6 +108,28 @@ _LOUD_VELOCITY_KEEP = 75
 # populates an energy-proxy velocity, a missing velocity must mean "keep"
 # — hence a sentinel above any real 0..127 value.
 _VELOCITY_WHEN_ABSENT = 999
+
+# A verified chord voicing may only relocate notes that are part of a
+# STRUMMED instance of that chord. An onset cluster instantiates a voicing
+# when at least this many DISTINCT voicing pitches sound in it
+# simultaneously (or the entire voicing, for voicings with fewer distinct
+# pitches — see _cluster_instantiates_voicing). Three simultaneous chord
+# tones is a chord by any definition; one or two are melody / double-stop
+# material that merely shares pitches with the chord. Without this gate
+# the Am voicing's open-high-e E4 hijacked Angie's taught fret-5
+# double-stop (E4 on B-5 under A4 on e-5), forcing both notes onto the
+# high-e string in one slot.
+#
+# Scope this gate deliberately gives up (measured on the Angie flagship
+# frets.json, 2026-06): of 3438 notes in a verified chord's span with a
+# voicing-covered pitch, the gate exempts 1746 from remapping, and 285
+# of those keep an algorithm (string, fret) that differs from the
+# verified target — notes picked one-or-two-at-a-time while the shape is
+# held (arpeggiated playing, common in Angie) never receive the
+# photo-verified correction. Known blind spot: `migs-tab verify` reads
+# frets.json and cannot see rendered string/fret changes, so no
+# automated check validates those exempted assignments either way.
+_STRUM_MIN_VOICING_PITCHES = 3
 
 # Demo-quality ranking when picking a canonical instance.
 _DEMO_QUALITY_RANK = {
@@ -415,14 +449,31 @@ def _apply_verified_chord_shapes(
     verified_data: dict,
     tuning: TuningInfo | None = None,
 ) -> list[dict]:
-    """Override (string, fret) for notes whose chord context has a verified
-    voicing for their pitch.
+    """Override (string, fret) for notes that are part of a strummed
+    instance of a chord with a verified voicing.
 
     For each note: look up the chord active at the note's start time. If
     the verified data has a structured ``voicing`` for that chord AND the
     voicing covers this exact MIDI pitch AND the note's time falls inside
-    the verified entry's ``applies_to`` scope, replace the algorithm's
-    (string, fret) with the verified ones.
+    the verified entry's ``applies_to`` scope AND the note's onset cluster
+    actually instantiates the voicing (>= _STRUM_MIN_VOICING_PITCHES
+    distinct voicing pitches sounding simultaneously — see
+    _cluster_instantiates_voicing), replace the algorithm's (string, fret)
+    with the verified ones. Melody and double-stop clusters that happen to
+    fall inside a chord span are exempt: a chord-shape photo is evidence
+    about how the chord is STRUMMED, not about every note sharing its
+    pitch set.
+
+    A literal strum also sounds each string at most once, so a remap is
+    cancelled whenever its target string is contested within the cluster
+    — either by another proposed remap (the Angie Am voicing carries
+    both E4 = open high-e and A4 = high-e fret 5, which one strum cannot
+    do) or by an UNMOVED cluster-mate that keeps sitting on that string.
+    The conflicting notes keep the algorithm's assignment instead of
+    being fused onto one string (which would silently drop a real
+    sounded note via the downstream same-slot winner rule). Cancelling a
+    remap reverts that note to its algorithm string, which can newly
+    contest other remaps' targets, so the guard iterates to a fixpoint.
 
     ``midi_pitch`` is optional in voicing entries: when absent it is
     derived from the tuning (``strings_midi[string] + capo + fret``), so
@@ -500,24 +551,86 @@ def _apply_verified_chord_shapes(
     if not by_chord:
         return notes
 
-    out: list[dict] = []
-    for n in notes:
+    # Distinct pitches per onset cluster, for the strum test. Notes
+    # without a cluster_id (defensive — frets.json always has one) are
+    # treated as singleton clusters.
+    pitches_by_cluster: dict[object, set[int]] = defaultdict(set)
+    for i, n in enumerate(notes):
+        pitches_by_cluster[_cluster_key(n, i)].add(int(n["pitch"]))
+
+    # Pass 1: propose remaps only for notes whose cluster instantiates
+    # the voicing.
+    proposals: dict[int, tuple[int, int, str]] = {}  # note idx → (string, fret, chord)
+    for i, n in enumerate(notes):
         chord = _chord_for_time(chord_spans, n["start"])
-        applied = False
-        if chord and chord in by_chord:
-            applies = applies_to_by_chord[chord]
-            if applies == "all_spans" or _in_any_time_range(applies, n["start"]):
-                target = by_chord[chord].get(int(n["pitch"]))
-                if target is not None:
-                    replacement = dict(n)
-                    replacement["string"] = target[0]
-                    replacement["fret"] = target[1]
-                    replacement["overridden_by"] = f"verified-shape:{chord}"
-                    out.append(replacement)
-                    applied = True
-        if not applied:
+        if not chord or chord not in by_chord:
+            continue
+        applies = applies_to_by_chord[chord]
+        if not (applies == "all_spans" or _in_any_time_range(applies, n["start"])):
+            continue
+        lookup = by_chord[chord]
+        target = lookup.get(int(n["pitch"]))
+        if target is None:
+            continue
+        if not _cluster_instantiates_voicing(pitches_by_cluster[_cluster_key(n, i)], set(lookup)):
+            continue
+        proposals[i] = (target[0], target[1], chord)
+
+    # Pass 2: same-string guard — cancel remaps whose target string is
+    # already sounded by a cluster-mate (a strum sounds each string at
+    # most once). A string is contested both when two PROPOSALS target it
+    # and when an UNMOVED cluster-mate occupies it; the original
+    # proposal-vs-proposal-only check missed the latter, so a relocated
+    # note landed on an unmoved mate's string and the same-slot winner
+    # rule silently dropped one of them (73 override-caused intra-cluster
+    # collisions on the Angie flagship, 0 produced natively). Cancelling
+    # a remap reverts that note to its algorithm string, which can newly
+    # contest other remaps' targets — iterate to a fixpoint (terminates:
+    # every round deletes at least one proposal).
+    while True:
+        landed: dict[tuple[object, int], list[int]] = defaultdict(list)
+        for i, n in enumerate(notes):
+            string = proposals[i][0] if i in proposals else int(n["string"])
+            landed[(_cluster_key(n, i), string)].append(i)
+        contested = [i for idxs in landed.values() if len(idxs) > 1 for i in idxs if i in proposals]
+        if not contested:
+            break
+        for i in contested:
+            del proposals[i]
+
+    out: list[dict] = []
+    for i, n in enumerate(notes):
+        prop = proposals.get(i)
+        if prop is None:
             out.append(n)
+            continue
+        replacement = dict(n)
+        replacement["string"] = prop[0]
+        replacement["fret"] = prop[1]
+        replacement["overridden_by"] = f"verified-shape:{prop[2]}"
+        out.append(replacement)
     return out
+
+
+def _cluster_key(note: dict, index: int) -> object:
+    """Stable grouping key for a note's onset cluster; notes lacking a
+    cluster_id each form their own singleton cluster."""
+    cid = note.get("cluster_id")
+    return cid if cid is not None else ("solo", index)
+
+
+def _cluster_instantiates_voicing(cluster_pitches: set[int], voicing_pitches: set[int]) -> bool:
+    """True when an onset cluster is a strummed instance of a voicing.
+
+    Rule: at least ``_STRUM_MIN_VOICING_PITCHES`` (3) distinct voicing
+    pitches sound simultaneously in the cluster, or — for voicings with
+    fewer than 3 distinct pitches (power chords, dyads) — every voicing
+    pitch does. 3-of-N is at least half of any playable voicing (max 6
+    strings) and a majority of 4-note voicings, while 1-2 chord tones are
+    indistinguishable from melody or a double-stop and stay exempt.
+    """
+    required = min(_STRUM_MIN_VOICING_PITCHES, len(voicing_pitches))
+    return len(cluster_pitches & voicing_pitches) >= required
 
 
 def _derive_midi_pitch(tuning: TuningInfo | None, string: int, fret: int) -> int | None:
@@ -899,17 +1012,21 @@ def _subdivisions_from_beats(beat_times: list[float]) -> list[tuple[float, bool]
 
 
 def _filter_noise(notes: list[dict]) -> list[dict]:
-    """Drop short, quiet, or duplicate-onset notes."""
+    """Drop short-AND-weak, quiet, or duplicate-onset notes."""
     survivors: list[dict] = []
     for n in notes:
         dur = n.get("end", n["start"]) - n["start"]
-        if dur < _MIN_NOTE_DURATION:
-            continue
-        # Quiet-note floor. frets.json notes carry NO velocity field today
-        # (MT3 emits constant velocity 100), so this gate is a no-op until
-        # the salience integration lands and adds energy-proxy velocities.
-        # Keep it: basic-pitch-backed runs DO have real velocities.
         vel = n.get("velocity")
+        # Short notes die only when ALSO weak (or strength is unverifiable
+        # because no velocity was recorded). A bare duration<0.08 gate
+        # deleted all 12 of LBTD's real staccato E-chord stabs
+        # (durations 0.04-0.07s, pseudo-velocities 79-111) — see
+        # _SHORT_NOTE_MIN_VELOCITY for the threshold rationale.
+        if dur < _MIN_NOTE_DURATION and (vel is None or vel < _SHORT_NOTE_MIN_VELOCITY):
+            continue
+        # Quiet-note floor, applies regardless of duration. CQT
+        # pseudo-velocities landed in frets.json with the wave-1..3 work;
+        # notes without one (older artifacts) pass through this gate.
         if vel is not None and vel < _MIN_NOTE_VELOCITY:
             continue
         survivors.append(n)
@@ -1085,11 +1202,14 @@ def _render_section_tab(
                 continue
             kept, dropped = _slot_winner(prev, n)
             kept_by_line[line_idx] = kept
+            dropped_tag = (
+                ", relocated by a verified-shape override" if "overridden_by" in dropped else ""
+            )
             layout_notes.append(
                 f"same-string conflict at +{dropped['start'] - section_t0:.1f}s — "
                 f"string {letters[line_idx]}: kept fret {kept['fret']}, "
-                f"dropped fret {dropped['fret']} (two notes on one string "
-                "in the same grid slot)"
+                f"dropped fret {dropped['fret']}{dropped_tag} (two notes on "
+                "one string in the same grid slot)"
             )
         # Distinct clusters still sharing one cell after the forward scan
         # would be drawn as a single chord the player never strummed —
@@ -1123,12 +1243,24 @@ def _render_section_tab(
 
 
 def _slot_winner(a: dict, b: dict) -> tuple[dict, dict]:
-    """Pick which of two same-string, same-slot notes survives: the
-    earlier onset wins; at equal onsets the longer note wins. Returns
-    ``(kept, dropped)``."""
+    """Pick which of two same-string, same-slot notes survives. Returns
+    ``(kept, dropped)``. Preference order:
 
-    def key(n: dict) -> tuple[float, float]:
-        return (n["start"], -(n.get("end", n["start"]) - n["start"]))
+    1. the note NOT relocated by a verified-chord-shape override — the
+       relocated note's string is a heuristic guess, the other one is the
+       fret algorithm's own assignment and more trustworthy in a conflict;
+    2. higher velocity (missing velocity uses the file-wide
+       ``_VELOCITY_WHEN_ABSENT`` sentinel: absent means "trust it");
+    3. earlier onset, then longer duration.
+    """
+
+    def key(n: dict) -> tuple[int, float, float, float]:
+        return (
+            1 if "overridden_by" in n else 0,
+            -float(n.get("velocity", _VELOCITY_WHEN_ABSENT)),
+            n["start"],
+            -(n.get("end", n["start"]) - n["start"]),
+        )
 
     return (a, b) if key(a) <= key(b) else (b, a)
 

@@ -35,6 +35,9 @@ dev = [
     "pytest>=9.0.3",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

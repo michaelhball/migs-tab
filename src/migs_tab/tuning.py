@@ -14,6 +14,15 @@ We try two strategies in order:
    a small library of common tuning candidates. We also check whether a
    capo would explain a chord set that doesn't fit standard.
 
+Whichever strategy wins, the candidate is then **cross-checked against the
+transcription** (``notes.mt3.json``, falling back to ``notes.json``) when one
+exists: sustained, repeated notes below the candidate's effective lowest
+sounding pitch (lowest open string + capo) are physically impossible, so they
+veto the candidate and we re-fit to the transcription's own pitch floor with
+reduced confidence (see :func:`verify_against_transcription`). If no
+transcription exists yet, the result is kept but marked unverified and its
+confidence is capped below 1.0.
+
 Output is ``cache/<video_id>/tuning.json``:
 
 ```json
@@ -22,8 +31,9 @@ Output is ``cache/<video_id>/tuning.json``:
   "capo": 0,
   "label": "Standard",
   "confidence": 0.9,
-  "source": "audio" | "captions" | "default",
-  "evidence": "..."
+  "source": "audio" | "captions" | "default" | "<source>+contradiction-veto",
+  "evidence": "...",
+  "verification": {"checked": true, "subfloor_sustained_count": 0, ...}
 }
 ```
 """
@@ -32,7 +42,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import librosa
@@ -72,6 +83,9 @@ class Tuning:
     confidence: float
     source: str
     evidence: str
+    # Result of the transcription cross-check (None until it has run).
+    # See verify_against_transcription() for the keys recorded here.
+    verification: dict | None = None
 
     def effective_open_pitches(self) -> list[int]:
         """Open-string pitches AFTER the capo. A capo at fret N raises every
@@ -79,7 +93,7 @@ class Tuning:
         return [p + self.capo for p in self.strings_midi]
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "strings_midi": self.strings_midi,
             "capo": self.capo,
             "label": self.label,
@@ -87,6 +101,9 @@ class Tuning:
             "source": self.source,
             "evidence": self.evidence,
         }
+        if self.verification is not None:
+            d["verification"] = self.verification
+        return d
 
 
 def default_tuning(reason: str = "no detection attempted") -> Tuning:
@@ -113,15 +130,18 @@ def detect_tuning(paths: VideoPaths, force: bool = False) -> VideoPaths:
     # Strategy 1: captions, if present and non-empty.
     caption_t = _detect_from_captions(paths) if paths.captions_text.exists() else None
     if caption_t is not None and caption_t.confidence >= 0.8:
-        paths.tuning_json.write_text(json.dumps(caption_t.to_dict(), indent=2))
-        return paths
+        chosen = caption_t
+    else:
+        # Strategy 2: audio. Prefer the isolated guitar stem; fall back to mixed.
+        audio_source = paths.guitar_stem if paths.guitar_stem.exists() else paths.audio
+        audio_t = _detect_from_audio(audio_source) if audio_source.exists() else None
 
-    # Strategy 2: audio. Prefer the isolated guitar stem; fall back to mixed.
-    audio_source = paths.guitar_stem if paths.guitar_stem.exists() else paths.audio
-    audio_t = _detect_from_audio(audio_source) if audio_source.exists() else None
+        # Combine evidence — captions weak but present + audio strong = audio wins.
+        chosen = audio_t or caption_t or default_tuning("no audio or captions usable")
 
-    # Combine evidence — captions weak but present + audio strong = audio wins.
-    chosen = audio_t or caption_t or default_tuning("no audio or captions usable")
+    # Strategy 3: cross-check the winner against the transcription — sustained
+    # notes below the candidate's effective floor veto it (see module docstring).
+    chosen = verify_against_transcription(chosen, paths)
     paths.tuning_json.write_text(json.dumps(chosen.to_dict(), indent=2))
     return paths
 
@@ -417,3 +437,269 @@ def _chroma_disambiguate(
     else:
         note = ""
     return label, midis, capo, note
+
+
+# ---------------------------------------------------------------------------
+# Transcription cross-check (capo/tuning contradiction veto)
+# ---------------------------------------------------------------------------
+
+# No tuning in the candidate library has an open string below MIDI 37
+# ("Drop D, half-step down"). Transcribed pitches below this floor are model
+# noise (cached MT3 output reaches down to MIDI 26) — never usable evidence.
+_TRANSCRIPTION_JUNK_FLOOR_MIDI = 37
+
+# Grace below the candidate's effective low pitch before a note counts as
+# contradictory — absorbs single-semitone transcription wobble and bends.
+_SUBFLOOR_GRACE_SEMITONES = 1
+
+# A sub-floor note must sustain at least this long to count as evidence;
+# anything shorter is an onset blip.
+_SUBFLOOR_MIN_NOTE_S = 0.1
+
+# Veto thresholds — ALL three must hold. Calibrated on cached videos
+# (measured with the junk floor at 37):
+#   9jswOBilMvA (wrong "Standard, capo 5"): 104 sustained sub-floor notes,
+#     43.0 s total, 6.7 % of all notes            → must veto
+#   wS_i91qxQYM (correct "Standard"): 4 sustained sub-floor notes (the MT3
+#     octave-error Bass hallucinations at MIDI 35-36 are junk-filtered),
+#     1.1 s, 0.06 % → must NOT veto
+_SUBFLOOR_VETO_MIN_COUNT = 12
+_SUBFLOOR_VETO_MIN_TOTAL_S = 8.0
+_SUBFLOOR_VETO_MIN_FRACTION = 0.015
+
+# A sub-floor pitch can only anchor the re-fit when it has enough sustained
+# instances AND carries meaningful weight of the sub-floor evidence: it must
+# be the modal sub-floor pitch, or hold at least the fraction below of the
+# sustained sub-floor notes. A handful of MT3 octave errors must not drag
+# the floor beneath the pitches the player actually sustained.
+_FLOOR_SUPPORT_MIN_COUNT = 3
+_FLOOR_SUPPORT_MIN_FRACTION = 0.15
+
+# MT3's General-MIDI program for transcribed speech/singing — the only
+# channel safe to drop wholesale (other non-guitar channels carry real
+# guitar notes; see mt3.py).
+_VOICE_PROGRAM = 65
+
+# Confidence ceilings. A capo that no transcription has confirmed can never
+# be 1.0 — reporting 1.0 from a single pyin statistic was the original bug.
+# A vetoed-and-refit result is capped lower still: audio and transcription
+# disagreed, so neither source is fully trustworthy.
+_UNVERIFIED_CONFIDENCE_CAP = 0.85
+_VETOED_CONFIDENCE_CAP = 0.75
+# ...and floored: a vetoed re-fit is still presented as the answer, so it
+# must never read as zero-confidence.
+_VETOED_CONFIDENCE_FLOOR = 0.2
+
+
+@dataclass
+class _SubfloorEvidence:
+    """Summary of transcribed notes below a candidate tuning's pitch floor."""
+
+    all_count: int  # every note below floor-grace (incl. blips)
+    sustained_count: int  # notes >= _SUBFLOOR_MIN_NOTE_S long
+    total_s: float  # summed duration of the sustained notes
+    fraction: float  # sustained_count / total notes examined
+    supported_floor: int | None  # lowest sub-floor pitch with real support
+    veto: bool
+
+
+def _read_notes_file(path: Path) -> list[dict] | None:
+    """Defensively parse a transcription JSON into [{pitch, start, end}, ...].
+
+    The mt3 JSON schema is in flux (per-note channel tags / voice filtering
+    are being added), so accept either ``{"notes": [...]}`` or a bare list,
+    skip malformed records, and drop drum / singing-voice notes whenever the
+    record carries enough metadata to identify them.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        # ValueError covers json.JSONDecodeError AND the UnicodeDecodeError
+        # a truncated non-UTF-8 file (killed MT3 run) raises from read_text.
+        return None
+    raw = data.get("notes") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return None
+    notes: list[dict] = []
+    for n in raw:
+        if not isinstance(n, dict):
+            continue
+        try:
+            pitch = int(n["pitch"])
+            start = float(n["start"])
+            end = float(n["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if n.get("is_drum"):
+            continue
+        program = n.get("program")
+        if program is not None:
+            try:
+                if int(program) == _VOICE_PROGRAM:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        name = str(n.get("instrument") or n.get("name") or "").lower()
+        if "voice" in name or "vocal" in name:
+            continue
+        notes.append({"pitch": pitch, "start": start, "end": end})
+    return notes or None
+
+
+def load_transcribed_notes(paths: VideoPaths) -> tuple[list[dict], str] | None:
+    """Best available transcription for cross-checking the tuning.
+
+    Prefers ``notes.mt3.json`` (the default tab source), falling back to
+    basic-pitch's ``notes.json``. Returns ``(notes, source_name)`` or None
+    when neither file yields usable notes.
+    """
+    for path, source in ((paths.notes_mt3_json, "mt3"), (paths.notes_json, "basic_pitch")):
+        notes = _read_notes_file(path)
+        if notes:
+            return notes, source
+    return None
+
+
+def _subfloor_evidence(notes: list[dict], effective_low: int) -> _SubfloorEvidence:
+    """Collect the notes that contradict an effective lowest sounding pitch."""
+    threshold = effective_low - _SUBFLOOR_GRACE_SEMITONES
+    sub = [n for n in notes if _TRANSCRIPTION_JUNK_FLOOR_MIDI <= n["pitch"] < threshold]
+    sustained = [n for n in sub if (n["end"] - n["start"]) >= _SUBFLOOR_MIN_NOTE_S]
+    total_s = float(sum(n["end"] - n["start"] for n in sustained))
+    fraction = len(sustained) / len(notes) if notes else 0.0
+
+    # The lowest sub-floor pitch with enough sustained instances — and a
+    # meaningful share of the sub-floor evidence — to anchor a re-fit. None
+    # when the sub-floor notes are scattered one-offs.
+    supported_floor: int | None = None
+    by_pitch = Counter(n["pitch"] for n in sustained)
+    if by_pitch:
+        modal_count = max(by_pitch.values())
+        min_share = _FLOOR_SUPPORT_MIN_FRACTION * len(sustained)
+        for pitch in sorted(by_pitch):
+            count = by_pitch[pitch]
+            if count < _FLOOR_SUPPORT_MIN_COUNT:
+                continue
+            if count == modal_count or count >= min_share:
+                supported_floor = pitch
+                break
+
+    veto = (
+        len(sustained) >= _SUBFLOOR_VETO_MIN_COUNT
+        and total_s >= _SUBFLOOR_VETO_MIN_TOTAL_S
+        and fraction >= _SUBFLOOR_VETO_MIN_FRACTION
+        and supported_floor is not None
+    )
+    return _SubfloorEvidence(
+        all_count=len(sub),
+        sustained_count=len(sustained),
+        total_s=total_s,
+        fraction=fraction,
+        supported_floor=supported_floor,
+        veto=veto,
+    )
+
+
+def _refit_to_floor(floor_midi: int, original: Tuning) -> tuple[str, list[int], int]:
+    """Pick the (tuning, capo) candidate whose effective low pitch best
+    explains the transcription's supported floor. Tie-breaks: smaller capo,
+    then keeping the originally-detected string set."""
+
+    def score(cand: tuple[str, list[int], int]) -> tuple[float, int, int]:
+        _, midis, capo = cand
+        delta = abs(floor_midi - (min(midis) + capo))
+        same_strings = 0 if list(midis) == list(original.strings_midi) else 1
+        return (delta, capo, same_strings)
+
+    return min(_AUDIO_CANDIDATES, key=score)
+
+
+def verify_against_transcription(tuning: Tuning, paths: VideoPaths) -> Tuning:
+    """Cross-check a chosen (tuning, capo) against the transcribed notes.
+
+    The audio heuristic can pick a capo the transcription flatly contradicts:
+    on 9jswOBilMvA pyin missed the low E2s and produced "Standard, capo 5" at
+    confidence 1.0 while notes.mt3.json held 96+ notes below the capo-5 floor
+    — every one of which was then silently deleted downstream (470 notes,
+    all the E and F#m chords). Sustained, repeated notes below the
+    candidate's effective lowest pitch are physically impossible, so they
+    VETO the candidate: we re-fit to the transcription's own supported floor
+    and reduce confidence. When no transcription exists yet, the result is
+    kept but marked unverified with confidence capped below 1.0.
+
+    Always records a ``verification`` dict on the returned Tuning so
+    tuning.json says WHY the result stands.
+    """
+    loaded = load_transcribed_notes(paths)
+    if loaded is None:
+        # Return a copy and guard the evidence suffix — verifying the same
+        # Tuning twice must not mutate the input or stack the suffix.
+        unverified_note = "; capo unverified (no transcription available at detection time)"
+        new_evidence = tuning.evidence
+        if unverified_note not in new_evidence:
+            new_evidence += unverified_note
+        return replace(
+            tuning,
+            confidence=min(tuning.confidence, _UNVERIFIED_CONFIDENCE_CAP),
+            evidence=new_evidence,
+            verification={
+                "checked": False,
+                "reason": "no transcription available at detection time",
+            },
+        )
+
+    notes, notes_source = loaded
+    effective_low = min(tuning.effective_open_pitches())
+    evidence = _subfloor_evidence(notes, effective_low)
+    verification = {
+        "checked": True,
+        "notes_source": notes_source,
+        "notes_examined": len(notes),
+        "effective_low_midi": effective_low,
+        "subfloor_count": evidence.all_count,
+        "subfloor_sustained_count": evidence.sustained_count,
+        "subfloor_total_s": round(evidence.total_s, 2),
+        "subfloor_fraction": round(evidence.fraction, 4),
+        "veto": False,
+    }
+
+    if not evidence.veto:
+        return replace(tuning, verification=verification)
+
+    # Contradiction: re-fit among candidates that can actually produce the
+    # transcription's supported floor pitch.
+    assert evidence.supported_floor is not None  # guaranteed when veto is True
+    best_label, best_midis, best_capo = _refit_to_floor(evidence.supported_floor, tuning)
+    new_low = min(best_midis) + best_capo
+    delta = evidence.supported_floor - new_low
+    confidence = min(
+        _VETOED_CONFIDENCE_CAP, max(_VETOED_CONFIDENCE_FLOOR, 1.0 - min(1.0, abs(delta)))
+    )
+    final_label = best_label if best_capo == 0 else f"{best_label}, capo {best_capo}"
+
+    residual = _subfloor_evidence(notes, new_low)
+    verification.update(
+        {
+            "veto": True,
+            "vetoed_label": tuning.label,
+            "supported_floor_midi": evidence.supported_floor,
+            "residual_subfloor_sustained_count": residual.sustained_count,
+        }
+    )
+    return Tuning(
+        strings_midi=list(best_midis),
+        capo=best_capo,
+        label=final_label,
+        confidence=round(confidence, 3),
+        source=f"{tuning.source}+contradiction-veto",
+        evidence=(
+            f"{tuning.evidence}; VETOED '{tuning.label}': {evidence.sustained_count} sustained "
+            f"transcribed notes ({evidence.total_s:.1f}s, {evidence.fraction:.1%} of "
+            f"{len(notes)} {notes_source} notes) sit below its effective low "
+            f"{effective_low}; re-fit to transcribed floor MIDI "
+            f"{evidence.supported_floor} → {final_label} (offset {delta:+d} st)"
+        ),
+        verification=verification,
+    )

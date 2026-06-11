@@ -1,5 +1,5 @@
 """Tests for tuning.py — caption pattern matching, library defaults, audio
-candidate generation."""
+candidate generation, transcription contradiction veto."""
 
 from __future__ import annotations
 
@@ -9,11 +9,15 @@ from migs_tab.paths import VideoPaths
 from migs_tab.tuning import (
     _AUDIO_CANDIDATES,
     _TUNING_LIBRARY,
+    _UNVERIFIED_CONFIDENCE_CAP,
+    _VETOED_CONFIDENCE_CAP,
     STANDARD_TUNING,
     Tuning,
     _detect_from_captions,
     default_tuning,
     detect_tuning,
+    load_transcribed_notes,
+    verify_against_transcription,
 )
 
 
@@ -179,3 +183,211 @@ def test_detect_tuning_writes_json_when_only_default_available(tmp_path):
     assert paths.tuning_json.exists()
     data = json.loads(paths.tuning_json.read_text())
     assert data["label"] == "Standard"
+    # With no transcription on disk the result must be flagged unverified.
+    assert data["verification"]["checked"] is False
+
+
+# ---------------------------------------------------------------------------
+# Transcription contradiction veto
+# ---------------------------------------------------------------------------
+
+
+def _note(pitch: int, start: float, dur: float = 0.5, **extra) -> dict:
+    n = {"start": start, "end": round(start + dur, 4), "pitch": pitch, "velocity": 100}
+    n.update(extra)
+    return n
+
+
+def _write_mt3_notes(paths: VideoPaths, notes: list[dict]) -> None:
+    paths.notes_mt3_json.write_text(
+        json.dumps({"backend": "mt3", "note_count": len(notes), "notes": notes})
+    )
+
+
+def _standard_capo5(confidence: float = 1.0) -> Tuning:
+    return Tuning(
+        strings_midi=list(STANDARD_TUNING),
+        capo=5,
+        label="Standard, capo 5",
+        confidence=confidence,
+        source="audio",
+        evidence="lowest sustained pitch ≈ MIDI 45.00",
+    )
+
+
+def _body_notes(n: int = 100, lo: int = 45, hi: int = 70) -> list[dict]:
+    """n unremarkable notes at/above the capo-5 floor."""
+    return [_note(lo + (i % (hi - lo)), 10.0 + i * 0.5) for i in range(n)]
+
+
+class TestContradictionVeto:
+    def test_e2_rich_notes_veto_capo5_to_capo0(self, tmp_path):
+        # Mirrors 9jswOBilMvA: dozens of sustained E2/F#2 notes below the
+        # capo-5 floor (45) must flip the result to Standard, capo 0.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.6) for i in range(20)]  # E2
+        notes += [_note(42, 130.0 + i, dur=0.5) for i in range(15)]  # F#2
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.capo == 0
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert result.label == "Standard"
+        assert result.confidence <= _VETOED_CONFIDENCE_CAP
+        assert "contradiction-veto" in result.source
+        assert result.verification["veto"] is True
+        assert result.verification["vetoed_label"] == "Standard, capo 5"
+        assert result.verification["supported_floor_midi"] == 40
+        assert result.verification["subfloor_sustained_count"] == 35
+
+    def test_genuinely_capoed_input_keeps_capo(self, tmp_path):
+        # All notes at/above the capo-5 floor: the capo is confirmed, the
+        # confidence untouched, and the check is recorded in verification.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_mt3_notes(paths, _body_notes(150))
+
+        result = verify_against_transcription(_standard_capo5(confidence=0.9), paths)
+        assert result.capo == 5
+        assert result.confidence == 0.9
+        assert result.source == "audio"
+        assert result.verification["checked"] is True
+        assert result.verification["veto"] is False
+        assert result.verification["subfloor_sustained_count"] == 0
+
+    def test_a_few_subfloor_blips_do_not_veto(self, tmp_path):
+        # 3 sustained sub-floor notes + 2 sub-10ms blips: far below every
+        # veto threshold — the capo must survive transcription noise.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.4) for i in range(3)]
+        notes += [_note(38, 110.0 + i, dur=0.02) for i in range(2)]
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.capo == 5
+        assert result.verification["veto"] is False
+        assert result.verification["subfloor_sustained_count"] == 3
+
+    def test_no_transcription_caps_confidence_and_marks_unverified(self, tmp_path):
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        result = verify_against_transcription(_standard_capo5(confidence=1.0), paths)
+        assert result.capo == 5  # behavior kept...
+        assert result.confidence <= _UNVERIFIED_CONFIDENCE_CAP  # ...but never 1.0
+        assert result.verification["checked"] is False
+        assert "unverified" in result.evidence
+
+    def test_voice_program_notes_are_ignored(self, tmp_path):
+        # Sub-floor notes tagged as MT3's Singing Voice program (65) are
+        # instructor speech, not guitar — they must not trigger the veto.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.6, program=65) for i in range(30)]
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.capo == 5
+        assert result.verification["veto"] is False
+        assert result.verification["subfloor_sustained_count"] == 0
+
+    def test_junk_midi36_cannot_hijack_refit_anchor(self, tmp_path):
+        # Regression: 30 genuine sustained E2s plus 3 sustained MT3 bass
+        # octave errors at MIDI 36 used to anchor the re-fit at 36 (bare
+        # lowest-with-3) and produce "Drop D, half-step down" at confidence
+        # 0.0. MIDI 36 is below every candidate's lowest open string, so it
+        # must be junk-filtered and the E2s must win: Standard, capo 0.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.6) for i in range(30)]  # genuine E2
+        notes += [_note(36, 140.0 + i, dur=0.6) for i in range(3)]  # octave junk
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert result.confidence == _VETOED_CONFIDENCE_CAP
+        assert result.verification["veto"] is True
+        assert result.verification["supported_floor_midi"] == 40
+
+    def test_sparse_low_pitch_above_junk_floor_cannot_anchor(self, tmp_path):
+        # 3 sustained notes at MIDI 37 (above the junk floor, so not
+        # filterable) vs 30 sustained E2s: the 37s carry ~9% of the
+        # sub-floor evidence and are far from modal, so the anchor must be
+        # the E2s — Standard capo 0, not "Drop D, half-step down".
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.6) for i in range(30)]
+        notes += [_note(37, 140.0 + i, dur=0.6) for i in range(3)]
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.verification["supported_floor_midi"] == 40
+
+    def test_malformed_mt3_json_falls_back_to_basic_pitch(self, tmp_path):
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        paths.notes_mt3_json.write_text("{not json")
+        notes = _body_notes(100) + [_note(40, 100.0 + i, dur=0.6) for i in range(30)]
+        paths.notes_json.write_text(json.dumps({"notes": notes}))
+
+        loaded = load_transcribed_notes(paths)
+        assert loaded is not None
+        assert loaded[1] == "basic_pitch"
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.capo == 0
+        assert result.verification["notes_source"] == "basic_pitch"
+
+    def test_non_utf8_mt3_json_falls_back_to_basic_pitch(self, tmp_path):
+        # A killed MT3 run can leave truncated non-UTF-8 bytes behind; the
+        # UnicodeDecodeError must be swallowed like any other unreadable
+        # file, falling back to basic-pitch instead of crashing.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        paths.notes_mt3_json.write_bytes(b"\xff\xfe\x00garbage\x80")
+        notes = _body_notes(100) + [_note(40, 100.0 + i, dur=0.6) for i in range(30)]
+        paths.notes_json.write_text(json.dumps({"notes": notes}))
+
+        loaded = load_transcribed_notes(paths)
+        assert loaded is not None
+        assert loaded[1] == "basic_pitch"
+
+        result = verify_against_transcription(_standard_capo5(), paths)
+        assert result.capo == 0
+        assert result.verification["notes_source"] == "basic_pitch"
+
+    def test_verify_is_idempotent_and_does_not_mutate_input(self, tmp_path):
+        # No transcription on disk: the input Tuning must come back
+        # untouched, and re-verifying the result must not stack the
+        # "capo unverified" suffix or change anything.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        original = _standard_capo5(confidence=1.0)
+
+        first = verify_against_transcription(original, paths)
+        assert original.confidence == 1.0
+        assert "unverified" not in original.evidence
+        assert original.verification is None
+
+        second = verify_against_transcription(first, paths)
+        assert second.evidence == first.evidence
+        assert second.evidence.count("capo unverified") == 1
+        assert second.confidence == first.confidence
+
+    def test_detect_tuning_applies_veto_to_caption_capo(self, tmp_path):
+        # End-to-end: captions claim capo 5, transcription is full of E2s —
+        # the written tuning.json must carry the vetoed, re-fit result.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        paths.captions_text.write_text("Put your capo on the 5th fret for this one")
+        notes = _body_notes(100)
+        notes += [_note(40, 100.0 + i, dur=0.6) for i in range(20)]
+        notes += [_note(42, 130.0 + i, dur=0.5) for i in range(15)]
+        _write_mt3_notes(paths, notes)
+
+        detect_tuning(paths, force=True)
+        data = json.loads(paths.tuning_json.read_text())
+        assert data["capo"] == 0
+        assert data["label"] == "Standard"
+        assert data["verification"]["veto"] is True
+        assert data["verification"]["subfloor_count"] >= 35
+        assert "contradiction-veto" in data["source"]

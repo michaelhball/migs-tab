@@ -131,6 +131,14 @@ class VideoPaths:
     def chord_shapes_verified_json(self) -> Path:
         return self.root / "chord-shapes-verified.json"
 
+    @property
+    def notes_mt3_midi(self) -> Path:
+        return self.root / "notes.mt3.mid"
+
+    @property
+    def notes_mt3_json(self) -> Path:
+        return self.root / "notes.mt3.json"
+
     def output_dir(self, output_root: Path) -> Path:
         """Return the output dir for this video. Uses a slugified version of
         the video's title from info.json so files are easy to find; falls

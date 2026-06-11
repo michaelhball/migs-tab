@@ -53,8 +53,8 @@ MAX_HAND_SPAN = 5
 # cluster (anchor updates to the latest note). A cluster stops growing
 # once its total span hits ``MAX_CLUSTER_DURATION`` — keeps long runs of
 # semi-related arpeggio notes from being mashed into one column.
-ONSET_CLUSTER_GAP = 0.18
-MAX_CLUSTER_DURATION = 0.40
+ONSET_CLUSTER_GAP = 0.08
+MAX_CLUSTER_DURATION = 0.20
 
 # Weights for the cluster's intrinsic cost (lower = better).
 # Tuned so an open-position shape scores strongly negative (driving the
@@ -530,17 +530,43 @@ class Shape:
 # ---------------------------------------------------------------------------
 
 
-def assign_frets(paths: VideoPaths, force: bool = False) -> VideoPaths:
-    """Run Viterbi fret assignment over the full notes.json, write frets.json."""
+_BACKEND_PATHS = {
+    "mt3": lambda p: p.notes_mt3_json,
+    "basic_pitch": lambda p: p.notes_json,
+}
+
+
+def _resolve_notes_source(paths: VideoPaths, backend: str):
+    """Pick the notes JSON file for the requested backend; fall back if missing."""
+    if backend not in _BACKEND_PATHS:
+        raise ValueError(f"unknown backend {backend!r}; choose one of {sorted(_BACKEND_PATHS)}")
+    primary = _BACKEND_PATHS[backend](paths)
+    if primary.exists():
+        return primary
+    # Fall back to whichever transcription file exists, preferring MT3 if both.
+    for fallback_backend in ("mt3", "basic_pitch"):
+        if fallback_backend == backend:
+            continue
+        candidate = _BACKEND_PATHS[fallback_backend](paths)
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"no notes file found at {primary} (or any other backend); run transcribe first"
+    )
+
+
+def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -> VideoPaths:
+    """Run Viterbi fret assignment over the chosen backend's notes, write frets.json.
+
+    backend = "mt3" (default) reads notes.mt3.json; "basic_pitch" reads notes.json.
+    Falls back to whichever file actually exists if the requested one is missing,
+    so users who only ran one of the transcribers still get a tab.
+    """
     if paths.frets_json.exists() and not force:
         return paths
 
-    if not paths.notes_json.exists():
-        raise FileNotFoundError(
-            f"notes.json not found at {paths.notes_json}; run transcribe first."
-        )
-
-    notes = json.loads(paths.notes_json.read_text())["notes"]
+    source = _resolve_notes_source(paths, backend)
+    notes = json.loads(source.read_text())["notes"]
     if not notes:
         paths.frets_json.write_text(json.dumps({"note_count": 0, "notes": []}, indent=2))
         return paths

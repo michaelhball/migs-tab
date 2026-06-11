@@ -19,6 +19,7 @@ from . import doctor as doctor_mod
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
+from . import mt3 as mt3_mod
 from . import render as render_mod
 from . import separate as separate_mod
 from . import structure as structure_mod
@@ -116,6 +117,43 @@ def transcribe(
     _print_status(paths)
 
 
+@app.command(name="transcribe-mt3")
+def transcribe_mt3(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    force: bool = typer.Option(False, "--force"),
+    variant: str = typer.Option(
+        "YMT3+", "--variant", help="YourMT3+ model variant (see mt3.py for choices)"
+    ),
+    batch_size: int = typer.Option(2, "--batch-size"),
+    on_mix: bool = typer.Option(
+        False,
+        "--on-mix",
+        help="Transcribe the raw mix instead of the Demucs guitar stem "
+        "(leaks instructor speech — debugging only)",
+    ),
+) -> None:
+    """Transcribe via YourMT3+ — writes notes.mt3.mid + notes.mt3.json (MPS-aware).
+
+    Defaults to the Demucs guitar stem when it exists, falling back to the raw
+    mix only when no stem has been separated yet.
+    """
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Transcribing[/bold] {paths.video_id} via YourMT3+ ({variant})")
+    try:
+        mt3_mod.transcribe(
+            paths,
+            force=force,
+            variant=variant,
+            batch_size=batch_size,
+            audio_source=paths.audio if on_mix else None,
+        )
+    except mt3_mod.MT3NotInstalled as exc:
+        console.print(f"[red]MT3 not installed:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    _print_status(paths)
+
+
 @app.command()
 def structure(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
@@ -154,11 +192,14 @@ def frets(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
     force: bool = typer.Option(False, "--force"),
+    backend: str = typer.Option(
+        "mt3", "--backend", help="Which transcription to use: mt3 (default) or basic_pitch"
+    ),
 ) -> None:
     """Assign string/fret positions to every note (Viterbi); write frets.json."""
     paths = _make_paths(url, cache_dir)
-    console.print(f"[bold]Assigning frets[/bold] for {paths.video_id}")
-    fret_mod.assign_frets(paths, force=force)
+    console.print(f"[bold]Assigning frets[/bold] for {paths.video_id} (backend={backend})")
+    fret_mod.assign_frets(paths, force=force, backend=backend)
     _print_status(paths)
 
 
@@ -168,10 +209,28 @@ def frame(
     timestamp: float = typer.Argument(..., help="Time in seconds to grab a frame"),
     label: str = typer.Option("", "--label", help="Suffix to append to the filename"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    zoom: bool = typer.Option(
+        False,
+        "--zoom",
+        help="Crop to the fretboard area only (drops body + picking hand, ~3x zoom)",
+    ),
+    crop: str = typer.Option(
+        "",
+        "--crop",
+        help="Custom crop as 'x0,y0,x1,y1' fractions 0..1 (e.g. '0.2,0.4,1.0,0.8'). Implies --zoom.",
+    ),
 ) -> None:
     """Extract a single still frame from the video at the given timestamp."""
     paths = _make_paths(url, cache_dir)
-    out = frames_mod.extract_frame(paths, timestamp, label=label or None)
+    crop_tuple: tuple[float, float, float, float] | None = None
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) != 4:
+            raise typer.BadParameter("--crop must have four comma-separated fractions")
+        crop_tuple = (parts[0], parts[1], parts[2], parts[3])
+    out = frames_mod.extract_frame(
+        paths, timestamp, label=label or None, zoom=zoom, crop=crop_tuple
+    )
     console.print(f"[green]✓[/green] {out}")
 
 
@@ -253,28 +312,92 @@ def process(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
     force: bool = typer.Option(False, "--force"),
+    mt3: bool = typer.Option(
+        True,
+        "--mt3/--no-mt3",
+        help="Run YourMT3+ on MPS after Demucs, on the guitar stem (default: on)",
+    ),
+    mt3_on_mix: bool = typer.Option(
+        False,
+        "--mt3-on-mix",
+        help="Feed MT3 the raw mix instead of the Demucs stem (leaks instructor "
+        "speech as a 'Singing Voice' note channel — debugging only)",
+    ),
+    basic_pitch: bool = typer.Option(
+        True,
+        "--basic-pitch/--no-basic-pitch",
+        help="Run basic-pitch (cheap, used for ornament hints; default: on)",
+    ),
+    backend: str = typer.Option(
+        "mt3",
+        "--backend",
+        help="Which transcription drives the tab: mt3 (default) or basic_pitch",
+    ),
+    mt3_variant: str = typer.Option("YMT3+", "--mt3-variant"),
 ) -> None:
-    """Run the plumbing pipeline: download → separate → transcribe → structure → frets."""
+    """Pipeline: download → separate → transcribe (both backends) → structure → frets."""
     paths = _make_paths(url, cache_dir)
     console.rule(f"[bold cyan]migs-tab • {paths.video_id}")
 
-    console.print("[bold]1/6[/bold] download")
+    console.print("[bold]1/7[/bold] download")
     download_mod.download(url, paths, force=force)
 
-    console.print("[bold]2/6[/bold] separate (Demucs)")
+    console.print("[bold]2/7[/bold] separate (Demucs)")
     separate_mod.separate(paths, force=force)
 
-    console.print("[bold]3/6[/bold] transcribe (basic-pitch)")
-    transcribe_mod.transcribe(paths, force=force)
+    if basic_pitch:
+        console.print("[bold]3/7[/bold] transcribe (basic-pitch)")
+        transcribe_mod.transcribe(paths, force=force)
+    else:
+        console.print("[bold]3/7[/bold] transcribe (basic-pitch) — [yellow]skipped[/yellow]")
 
-    console.print("[bold]4/6[/bold] structure (librosa)")
+    if mt3:
+        # MT3 runs AFTER Demucs, on the clean guitar stem (MPS-backed driver).
+        # Running it on the raw mix in parallel used to leak instructor speech
+        # into the transcription as a 670-note "Singing Voice" channel —
+        # correctness beats the lost parallelism. audio_source=None lets the
+        # resolver prefer the stem and degrade to the mix if the stem is gone.
+        mt3_source = paths.audio if mt3_on_mix else None
+        if mt3_on_mix:
+            source_label = "raw mix"
+        elif paths.guitar_stem.exists():
+            source_label = "guitar stem"
+        else:
+            source_label = "raw mix — stem missing"
+        if force or not (paths.notes_mt3_midi.exists() and paths.notes_mt3_json.exists()):
+            console.print(f"[bold]4/7[/bold] transcribe (YourMT3+ {mt3_variant}, {source_label})")
+            try:
+                mt3_mod.transcribe(paths, force=force, variant=mt3_variant, audio_source=mt3_source)
+                console.print("[green]✓[/green] MT3 done")
+            except mt3_mod.MT3NotInstalled as exc:
+                console.print(f"[yellow]skipping MT3:[/yellow] {exc}")
+            except subprocess.CalledProcessError as exc:
+                console.print(
+                    f"[red]MT3 exited with code {exc.returncode}[/red] — "
+                    "continuing with basic-pitch only"
+                )
+        else:
+            import json as _json
+
+            cached_source = None
+            try:
+                provenance = _json.loads(paths.notes_mt3_json.read_text()).get("provenance") or {}
+                cached_source = provenance.get("audio_source")
+            except (OSError, ValueError):
+                pass
+            suffix = f" (source: {cached_source})" if cached_source else ""
+            console.print(f"[bold]4/7[/bold] transcribe (YourMT3+) — cached, skipping{suffix}")
+    else:
+        console.print("[bold]4/7[/bold] transcribe (YourMT3+) — [yellow]skipped[/yellow]")
+
+    console.print("[bold]5/7[/bold] structure (librosa)")
     structure_mod.analyze_structure(paths, force=force)
 
-    console.print("[bold]5/6[/bold] tuning")
+    console.print("[bold]6/7[/bold] tuning")
     tuning_mod.detect_tuning(paths, force=force)
 
-    console.print("[bold]6/6[/bold] frets (Viterbi)")
-    fret_mod.assign_frets(paths, force=force)
+    console.print(f"[bold]7/7[/bold] frets (Viterbi, backend={backend})")
+    fret_mod.assign_frets(paths, force=force, backend=backend)
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)

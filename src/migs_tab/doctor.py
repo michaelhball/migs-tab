@@ -82,6 +82,41 @@ def _check_output_dir() -> CheckResult:
     )
 
 
+_MT3_DIR = PROJECT_ROOT / "third_party" / "YourMT3"
+_MT3_DEFAULT_CKPT = (
+    _MT3_DIR
+    / "amt"
+    / "logs"
+    / "2024"
+    / "notask_all_cross_v6_xk2_amp0811_gm_ext_plus_nops_b72"
+    / "checkpoints"
+    / "model.ckpt"
+)
+_MT3_VENV_PYTHON = _MT3_DIR / ".venv" / "bin" / "python"
+# LFS pointer files are ~130 bytes; the real checkpoint is >100 MB. Any value
+# in between catches "you forgot to git lfs pull" without false negatives.
+_MT3_CKPT_MIN_BYTES = 10 * 1024 * 1024
+
+
+def _check_mt3_install() -> CheckResult:
+    """Optional: YourMT3+ vendored install (driver + venv + lightest checkpoint)."""
+    if not _MT3_DIR.exists():
+        return CheckResult("mt3 (optional)", True, "not installed — basic-pitch is the default")
+    missing: list[str] = []
+    if not (_MT3_DIR / "migs_driver.py").exists():
+        missing.append("driver script")
+    if not _MT3_VENV_PYTHON.exists():
+        missing.append(f"venv at {_MT3_VENV_PYTHON.parent.parent}")
+    if not _MT3_DEFAULT_CKPT.exists():
+        missing.append("YMT3+ checkpoint")
+    elif _MT3_DEFAULT_CKPT.stat().st_size < _MT3_CKPT_MIN_BYTES:
+        missing.append("YMT3+ checkpoint (LFS pointer only — run `git lfs pull`)")
+    if missing:
+        return CheckResult("mt3 (optional)", False, "missing: " + ", ".join(missing))
+    size_mb = _MT3_DEFAULT_CKPT.stat().st_size / (1024 * 1024)
+    return CheckResult("mt3 (optional)", True, f"venv + YMT3+ checkpoint ready ({size_mb:.0f} MB)")
+
+
 def _check_disk_space() -> CheckResult:
     total, used, free = shutil.disk_usage(PROJECT_ROOT)
     free_gb = free / (1024**3)
@@ -126,6 +161,7 @@ def run_checks() -> list[CheckResult]:
         _check_python_package("PIL"),
         _check_python_package("scipy"),
         _check_python_package("numpy"),
+        _check_mt3_install(),
         _check_cache_dir(),
         _check_output_dir(),
         _check_disk_space(),

@@ -16,6 +16,16 @@ from pathlib import Path
 
 from .paths import VideoPaths
 
+# Default fretboard crop region as fractions of (width, height). Tuned for
+# the typical front-facing seated-instructor framing (Shutup&Play, Marty
+# Music, etc.) where the body occupies the lower-left and the neck extends
+# upper-right. Crops out the body+picking-hand and zooms ~3x on the
+# fretboard, making individual fret dots and finger placements legible.
+#
+# Override via the CLI when a video has unusual framing. Encoded as
+# (x_start, y_start, x_end, y_end) where each is a fraction in [0, 1].
+DEFAULT_FRETBOARD_CROP = (0.20, 0.40, 1.00, 0.80)
+
 
 def extract_frame(
     paths: VideoPaths,
@@ -23,11 +33,17 @@ def extract_frame(
     out_dir: Path | None = None,
     label: str | None = None,
     overwrite: bool = False,
+    zoom: bool = False,
+    crop: tuple[float, float, float, float] | None = None,
 ) -> Path:
     """Extract a single video frame at the given timestamp.
 
     The file is named ``t<seconds>_<label>.jpg`` (label optional) and lives
     in ``cache/<id>/frames/`` unless ``out_dir`` overrides.
+
+    Set ``zoom=True`` to apply ``DEFAULT_FRETBOARD_CROP`` so the fretboard
+    fills the frame — much easier to read individual frets. Pass an explicit
+    ``crop=(x0, y0, x1, y1)`` (each a 0..1 fraction) to override the default.
     """
     if not paths.video.exists():
         raise FileNotFoundError(f"Video not found at {paths.video}")
@@ -39,12 +55,14 @@ def extract_frame(
 
     stamp = f"{timestamp_seconds:08.3f}".replace(".", "_")
     suffix = f"_{label}" if label else ""
+    if zoom or crop is not None:
+        suffix += "_zoom"
     out_path = target_dir / f"t{stamp}{suffix}.jpg"
 
     if out_path.exists() and not overwrite:
         return out_path
 
-    cmd = [
+    cmd: list[str] = [
         "ffmpeg",
         "-y",
         "-loglevel",
@@ -57,8 +75,19 @@ def extract_frame(
         "1",
         "-q:v",
         "3",  # JPEG quality 3 ~ visually lossless, ~50-150 KB per frame
-        str(out_path),
     ]
+    if zoom or crop is not None:
+        x0, y0, x1, y1 = crop if crop is not None else DEFAULT_FRETBOARD_CROP
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            raise ValueError(f"invalid crop fractions: {(x0, y0, x1, y1)!r}")
+        # ffmpeg crop=w:h:x:y using fractional expressions on input dims.
+        cmd.extend(
+            [
+                "-vf",
+                f"crop=in_w*{x1 - x0:.4f}:in_h*{y1 - y0:.4f}:in_w*{x0:.4f}:in_h*{y0:.4f}",
+            ]
+        )
+    cmd.append(str(out_path))
     subprocess.run(cmd, check=True)
     return out_path
 

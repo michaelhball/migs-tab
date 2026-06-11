@@ -21,3 +21,7 @@ output/
 .DS_Store
 .idea/
 .vscode/
+.claude/settings.local.json
+
+# Vendored YourMT3 clone (own .git, venv, 500MB checkpoint) — setup: scripts/yourmt3/SETUP.md
+third_party/

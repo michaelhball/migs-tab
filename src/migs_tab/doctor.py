@@ -5,13 +5,15 @@ when something isn't working as expected.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .paths import DEFAULT_CACHE_DIR, DEFAULT_OUTPUT_DIR, PROJECT_ROOT
+from .paths import DEFAULT_CACHE_DIR, DEFAULT_OUTPUT_DIR, PROJECT_ROOT, VideoPaths
 
 
 @dataclass
@@ -117,6 +119,102 @@ def _check_mt3_install() -> CheckResult:
     return CheckResult("mt3 (optional)", True, f"venv + YMT3+ checkpoint ready ({size_mb:.0f} MB)")
 
 
+# Canonical, version-tracked copy of the YourMT3 driver (see
+# scripts/yourmt3/SETUP.md). third_party/YourMT3/ is gitignored, so edits to
+# the deployed copy silently drift from the tracked one — hash-compare them.
+_DRIVER_CANONICAL = PROJECT_ROOT / "scripts" / "yourmt3" / "migs_driver.py"
+_DRIVER_DEPLOYED = _MT3_DIR / "migs_driver.py"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _ast_dump(path: Path) -> str | None:
+    """Canonical AST dump of a Python source file; None when unparseable."""
+    try:
+        return ast.dump(ast.parse(path.read_text()))
+    except (SyntaxError, ValueError, OSError):
+        return None
+
+
+def _check_driver_sync() -> CheckResult:
+    """Warn when the deployed MT3 driver drifts from the tracked copy.
+
+    Formatting-only drift (byte-different but AST-identical, e.g. a ruff
+    re-format of the tracked copy that was never re-deployed) passes with a
+    reconcile nudge instead of failing: doctor exits 1 on any failed check,
+    and a cosmetic diff must not break scripts gating on that exit code.
+    Behavioral (AST-visible) drift still fails hard.
+    """
+    if not _DRIVER_DEPLOYED.exists():
+        return CheckResult("mt3 driver", True, "third_party copy not deployed — nothing to compare")
+    if not _DRIVER_CANONICAL.exists():
+        return CheckResult("mt3 driver", False, f"canonical copy missing at {_DRIVER_CANONICAL}")
+    canonical, deployed = _sha256(_DRIVER_CANONICAL), _sha256(_DRIVER_DEPLOYED)
+    if canonical == deployed:
+        return CheckResult(
+            "mt3 driver", True, f"deployed copy matches scripts/yourmt3 (sha256 {canonical[:12]})"
+        )
+    ast_canonical = _ast_dump(_DRIVER_CANONICAL)
+    if ast_canonical is not None and ast_canonical == _ast_dump(_DRIVER_DEPLOYED):
+        return CheckResult(
+            "mt3 driver",
+            True,
+            f"formatting-only drift (ASTs identical): deployed sha256 {deployed[:12]} != "
+            f"tracked {canonical[:12]} — "
+            "`cp scripts/yourmt3/migs_driver.py third_party/YourMT3/` to silence",
+        )
+    return CheckResult(
+        "mt3 driver",
+        False,
+        f"DRIFT: {_DRIVER_DEPLOYED} (sha256 {deployed[:12]}) != tracked "
+        f"{_DRIVER_CANONICAL} (sha256 {canonical[:12]}) — reconcile, then "
+        "`cp scripts/yourmt3/migs_driver.py third_party/YourMT3/`",
+    )
+
+
+def _check_verification() -> CheckResult:
+    """Report whether each fret-assigned video has a fresh verification.json
+    (fresh = at least as new as EVERY verify input: frets, both note files,
+    sections, tuning, the stem — verify.verification_input_paths)."""
+    # Lazy import: verify pulls librosa via salience, and doctor must still
+    # run (and report the broken package) when that import chain is dead.
+    try:
+        from .verify import verification_input_paths
+    except ImportError as e:
+        return CheckResult("verification", False, f"verify module unimportable: {e!r}")
+    if not DEFAULT_CACHE_DIR.exists():
+        return CheckResult("verification", True, "no cache yet")
+    fresh: list[str] = []
+    stale: list[str] = []
+    missing: list[str] = []
+    for d in sorted(DEFAULT_CACHE_DIR.iterdir()):
+        frets = d / "frets.json"
+        if not d.is_dir() or not frets.exists():
+            continue
+        verification = d / "verification.json"
+        inputs = verification_input_paths(VideoPaths(d.name, cache_dir=DEFAULT_CACHE_DIR))
+        newest_input = max((p.stat().st_mtime for p in inputs if p.exists()), default=0.0)
+        if not verification.exists():
+            missing.append(d.name)
+        elif verification.stat().st_mtime >= newest_input:
+            fresh.append(d.name)
+        else:
+            stale.append(d.name)
+    total = len(fresh) + len(stale) + len(missing)
+    if not total:
+        return CheckResult("verification", True, "no fret-assigned videos yet")
+    detail = f"{len(fresh)}/{total} video(s) fresh"
+    if stale:
+        detail += (
+            f"; STALE (older than a verify input): {', '.join(stale)} — re-run `migs-tab verify`"
+        )
+    if missing:
+        detail += f"; never verified: {', '.join(missing)}"
+    return CheckResult("verification", not stale, detail)
+
+
 def _check_disk_space() -> CheckResult:
     total, used, free = shutil.disk_usage(PROJECT_ROOT)
     free_gb = free / (1024**3)
@@ -162,7 +260,9 @@ def run_checks() -> list[CheckResult]:
         _check_python_package("scipy"),
         _check_python_package("numpy"),
         _check_mt3_install(),
+        _check_driver_sync(),
         _check_cache_dir(),
         _check_output_dir(),
+        _check_verification(),
         _check_disk_space(),
     ]

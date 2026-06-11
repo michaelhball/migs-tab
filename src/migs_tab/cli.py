@@ -25,6 +25,7 @@ from . import separate as separate_mod
 from . import structure as structure_mod
 from . import transcribe as transcribe_mod
 from . import tuning as tuning_mod
+from . import verify as verify_mod
 from .paths import DEFAULT_CACHE_DIR, DEFAULT_OUTPUT_DIR, VideoPaths, extract_video_id
 
 app = typer.Typer(
@@ -308,6 +309,79 @@ def render(
 
 
 @app.command()
+def verify(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Write verification.json here instead of the cache (read-only experiments / tests)",
+    ),
+) -> None:
+    """Score the tab against the audio + the second model; write verification.json.
+
+    Exits nonzero only on hard errors (missing inputs) — bad scores are
+    reported, not enforced.
+    """
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Verifying[/bold] {paths.video_id}")
+    try:
+        report = verify_mod.verify(paths, out_path=output)
+    except verify_mod.VerifyError as exc:
+        console.print(f"[red]verify failed:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    _print_verification(report)
+    console.print(f"\n[green]✓[/green] wrote {output or paths.verification_json}")
+
+
+_BAND_STYLES = {
+    verify_mod.BAND_SOLID: "green",
+    verify_mod.BAND_SUSPECT: "yellow",
+    verify_mod.BAND_BAD: "red",
+    verify_mod.BAND_NO_NOTES: "dim",
+}
+
+
+def _print_verification(report: dict) -> None:
+    def fmt(value: float | None, spec: str = ".3f") -> str:
+        return "—" if value is None else format(value, spec)
+
+    console.print(
+        f"\n  {'section':<34} {'window':>17} {'notes':>5} {'sal':>6} "
+        f"{'sup%':>6} {'agr%':>6} {'score':>6}  band"
+    )
+    for s in report["per_section"]:
+        style = _BAND_STYLES.get(s["band"], "white")
+        window = f"{s['window'][0]:>7.1f}-{s['window'][1]:>7.1f}s"
+        pct_sup = None if s["pct_supported"] is None else 100 * s["pct_supported"]
+        pct_agr = None if s["agreement_rate"] is None else 100 * s["agreement_rate"]
+        console.print(
+            f"  {(s['label'] or '?')[:34]:<34} {window:>17} {s['n_notes']:>5} "
+            f"{fmt(s['salience_mean']):>6} {fmt(pct_sup, '.0f'):>6} "
+            f"{fmt(pct_agr, '.0f'):>6} {fmt(s['section_score']):>6}  "
+            f"[{style}]{s['band']}[/{style}]"
+        )
+    summary = report["summary"]
+    console.print(f"\n  notes: {summary['note_count']}  verdicts: {summary['verdicts']}")
+    console.print(f"  agreement: {summary['agreement']}")
+    capo = summary["capo_check"]
+    if capo.get("present"):
+        recomputed = capo.get("recomputed") or {}
+        veto = recomputed.get("would_veto")
+        veto_style = "red" if veto else "green"
+        console.print(
+            f"  capo check: {capo.get('label')} (capo {capo.get('capo')}) — "
+            f"sub-floor sustained notes now: {recomputed.get('subfloor_sustained_count', '?')}, "
+            f"would_veto=[{veto_style}]{veto}[/{veto_style}]"
+        )
+    else:
+        console.print("  capo check: tuning.json not present")
+    band = summary["overall_band"]
+    style = _BAND_STYLES.get(band, "white")
+    console.print(f"  overall band: [{style}]{band}[/{style}]")
+
+
+@app.command()
 def process(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
     cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
@@ -334,22 +408,28 @@ def process(
         help="Which transcription drives the tab: mt3 (default) or basic_pitch",
     ),
     mt3_variant: str = typer.Option("YMT3+", "--mt3-variant"),
+    run_verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Score the finished frets against the audio (writes verification.json; "
+        "keeps doctor's freshness check green)",
+    ),
 ) -> None:
-    """Pipeline: download → separate → transcribe (both backends) → structure → frets."""
+    """Pipeline: download → separate → transcribe (both backends) → structure → frets → verify."""
     paths = _make_paths(url, cache_dir)
     console.rule(f"[bold cyan]migs-tab • {paths.video_id}")
 
-    console.print("[bold]1/7[/bold] download")
+    console.print("[bold]1/8[/bold] download")
     download_mod.download(url, paths, force=force)
 
-    console.print("[bold]2/7[/bold] separate (Demucs)")
+    console.print("[bold]2/8[/bold] separate (Demucs)")
     separate_mod.separate(paths, force=force)
 
     if basic_pitch:
-        console.print("[bold]3/7[/bold] transcribe (basic-pitch)")
+        console.print("[bold]3/8[/bold] transcribe (basic-pitch)")
         transcribe_mod.transcribe(paths, force=force)
     else:
-        console.print("[bold]3/7[/bold] transcribe (basic-pitch) — [yellow]skipped[/yellow]")
+        console.print("[bold]3/8[/bold] transcribe (basic-pitch) — [yellow]skipped[/yellow]")
 
     if mt3:
         # MT3 runs AFTER Demucs, on the clean guitar stem (MPS-backed driver).
@@ -365,7 +445,7 @@ def process(
         else:
             source_label = "raw mix — stem missing"
         if force or not (paths.notes_mt3_midi.exists() and paths.notes_mt3_json.exists()):
-            console.print(f"[bold]4/7[/bold] transcribe (YourMT3+ {mt3_variant}, {source_label})")
+            console.print(f"[bold]4/8[/bold] transcribe (YourMT3+ {mt3_variant}, {source_label})")
             try:
                 mt3_mod.transcribe(paths, force=force, variant=mt3_variant, audio_source=mt3_source)
                 console.print("[green]✓[/green] MT3 done")
@@ -386,18 +466,29 @@ def process(
             except (OSError, ValueError):
                 pass
             suffix = f" (source: {cached_source})" if cached_source else ""
-            console.print(f"[bold]4/7[/bold] transcribe (YourMT3+) — cached, skipping{suffix}")
+            console.print(f"[bold]4/8[/bold] transcribe (YourMT3+) — cached, skipping{suffix}")
     else:
-        console.print("[bold]4/7[/bold] transcribe (YourMT3+) — [yellow]skipped[/yellow]")
+        console.print("[bold]4/8[/bold] transcribe (YourMT3+) — [yellow]skipped[/yellow]")
 
-    console.print("[bold]5/7[/bold] structure (librosa)")
+    console.print("[bold]5/8[/bold] structure (librosa)")
     structure_mod.analyze_structure(paths, force=force)
 
-    console.print("[bold]6/7[/bold] tuning")
+    console.print("[bold]6/8[/bold] tuning")
     tuning_mod.detect_tuning(paths, force=force)
 
-    console.print(f"[bold]7/7[/bold] frets (Viterbi, backend={backend})")
+    console.print(f"[bold]7/8[/bold] frets (Viterbi, backend={backend})")
     fret_mod.assign_frets(paths, force=force, backend=backend)
+
+    if run_verify:
+        # Keeps verification.json at least as fresh as the artifacts above,
+        # so doctor's freshness check stays green after every pipeline run.
+        console.print("[bold]8/8[/bold] verify (salience + agreement + section scores)")
+        try:
+            _print_verification(verify_mod.verify(paths))
+        except verify_mod.VerifyError as exc:
+            console.print(f"[yellow]verify skipped:[/yellow] {exc}")
+    else:
+        console.print("[bold]8/8[/bold] verify — [yellow]skipped[/yellow]")
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)

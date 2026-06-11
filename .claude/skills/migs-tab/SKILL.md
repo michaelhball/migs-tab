@@ -335,6 +335,29 @@ Section order in the rendered tab follows `sections.json` (typically the
 tutorial's teaching order, which is generally a sensible play-through
 order for learning).
 
+### Step 6.5 — Verify the tab (Python, fast)
+
+```bash
+uv run migs-tab verify <url>
+```
+
+Runs automatically as the last step of `process`, but re-run it after any
+manual override or re-render. Scores the tab against the audio evidence and
+writes `cache/<id>/verification.json`:
+
+- **Per-note verdicts** (CQT salience vs the guitar stem): `supported` /
+  `weak` / `phantom-suspect` / `octave-suspect` / `unscored`.
+- **Cross-model agreement** between basic-pitch and MT3 per section.
+- **Tuning/capo contradiction check** — the only check that catches a wrong
+  capo (audio-only scores stay self-consistent under one).
+- **Per-section synthesize-and-compare score** (Karplus-Strong render vs the
+  stem, chroma cosine), banded `solid` (>0.85) / `suspect` / `bad` (<0.70).
+
+Use the per-section table to target review effort: point the vision pass
+(Step 5) at `suspect`/`bad` sections and at `octave-suspect` notes instead of
+sampling blindly. Surface the overall band and any capo veto in your final
+summary to the user.
+
 ### Step 7 — Final summary (you do this)
 
 After Phase 4 print:

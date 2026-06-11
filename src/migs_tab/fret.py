@@ -595,6 +595,10 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
         return paths
 
     source = _resolve_notes_source(paths, backend)
+    # Provenance for verify's agreement tiers: record which backend's notes
+    # were ACTUALLY used (the fallback in _resolve_notes_source can differ
+    # from the requested one), not the one that was asked for.
+    source_backend = "mt3" if source == paths.notes_mt3_json else "basic_pitch"
     notes = json.loads(source.read_text())["notes"]
     if not notes:
         paths.frets_json.write_text(json.dumps({"note_count": 0, "notes": []}, indent=2))
@@ -617,11 +621,13 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     # the CQT contexts are built then, for the overtone pass below.
     # No stem → contexts is None and everything behaves exactly as before.
     evidence_contexts: dict[int, CQTContext] | None = None
+    pseudo_velocities = False
     if paths.guitar_stem.exists():
+        pseudo_velocities = source == paths.notes_mt3_json
         evidence_contexts = _attach_pseudo_velocities(
             notes,
             paths.guitar_stem,
-            overwrite_velocities=source == paths.notes_mt3_json,
+            overwrite_velocities=pseudo_velocities,
         )
 
     chord_spans: list[tuple[float, float, str]] = []
@@ -640,7 +646,11 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             notes, clusters, evidence_contexts
         )
 
-    notes, clusters = _filter_sympathetic_resonance(notes, clusters)
+    # The bass exemption is tied to pseudo-velocities, NOT to the gate
+    # itself: it compensates for the CQT under-measuring low strings, a
+    # bias basic-pitch confidence velocities don't have (see the
+    # _filter_sympathetic_resonance docstring).
+    notes, clusters = _filter_sympathetic_resonance(notes, clusters, bass_exempt=pseudo_velocities)
     # When the audio-evidence pass ran, the calibrated CQT octave test above
     # owns +12 adjudication — the velocity gate must not re-decide it (see
     # _HARMONIC_OFFSETS_EVIDENCE).
@@ -660,7 +670,26 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     playable_ids: list[int] = []
     playable: list[tuple[list[int], list[Shape]]] = []
     unplayable_clusters: list[dict] = []
+    unplayable_notes: list[dict] = []
     for cidx, (cluster, shapes) in enumerate(zip(clusters, cluster_shapes, strict=True)):
+        if not shapes and len(cluster) >= 2:
+            # Salvage: drop only the members that block fingerability
+            # instead of silently deleting the whole cluster (singletons
+            # keep the old whole-cluster path — there is nothing to save).
+            kept, kept_shapes, salvage_dropped = _salvage_unplayable_cluster(notes, cluster)
+            if kept:
+                cluster, shapes = kept, kept_shapes
+                for i, reason in salvage_dropped:
+                    record = {
+                        "cluster_id": cidx,
+                        "start": notes[i]["start"],
+                        "end": notes[i]["end"],
+                        "pitch": notes[i]["pitch"],
+                        "reason": reason,
+                    }
+                    if "velocity" in notes[i]:
+                        record["velocity"] = notes[i]["velocity"]
+                    unplayable_notes.append(record)
         if shapes:
             playable_ids.append(cidx)
             playable.append((cluster, shapes))
@@ -729,6 +758,9 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
         "cluster_count": len(cluster_records),
         "ambiguous_cluster_count": sum(1 for c in cluster_records if c["ambiguous"]),
         "unplayable_clusters": unplayable_clusters,
+        # Individual notes dropped by _salvage_unplayable_cluster so their
+        # cluster-mates could keep a playable shape (recorded, not silent).
+        "unplayable_notes": unplayable_notes,
         "tuning": {"low_to_high_midi": list(_ACTIVE_TUNING)},
         "params": {
             "max_fret": MAX_FRET,
@@ -737,6 +769,8 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             "max_cluster_duration": MAX_CLUSTER_DURATION,
             "ambiguity_margin": _AMBIGUITY_MARGIN,
             "audio_evidence": evidence_contexts is not None,
+            "backend": source_backend,
+            "source_notes_file": source.name,
         },
         "clusters": cluster_records,
         "notes": note_records,
@@ -1028,7 +1062,7 @@ _SYMPATHETIC_RATIO = 0.50
 
 
 def _filter_sympathetic_resonance(
-    notes: list[dict], clusters: list[list[int]]
+    notes: list[dict], clusters: list[list[int]], bass_exempt: bool = False
 ) -> tuple[list[dict], list[list[int]]]:
     """Drop the very-quiet notes within each onset cluster.
 
@@ -1042,6 +1076,23 @@ def _filter_sympathetic_resonance(
     cluster; anything below ``_SYMPATHETIC_RATIO`` of that peak velocity
     is dropped. Single-note clusters are unaffected (no peak to compare
     against meaningfully).
+
+    With ``bass_exempt`` the LOWEST-pitch note of each cluster is kept
+    regardless of velocity. The caller sets it ONLY when CQT
+    pseudo-velocities were attached (MT3 + stem runs): the CQT
+    systematically under-measures low strings (fewer bins, wider spacing
+    at low frequencies), so bass roots get unfairly low values — on
+    Angie's t=903.2 s open-E7 demo the REAL E2 pedal (pitch 40) measured
+    velocity 33 vs cluster peak 84 and this gate deleted it alongside
+    the genuine phantoms (64@11, 68@0). basic-pitch confidence
+    velocities carry no such low-string bias, and on those runs this
+    gate is the ONLY defense against quiet bass artifacts: a sub-octave
+    ghost at p-12 is by construction the cluster's lowest pitch, the
+    overtone gates only look upward (+12/+19/+24), and the chord-context
+    filter can't drop it (it shares the real bass's pitch class) —
+    while no-stem basic-pitch runs also write NO velocities into
+    frets.json, leaving render without a quiet-note backstop. So the
+    exemption must stay off whenever velocities are basic-pitch native.
     """
     if not clusters:
         return notes, clusters
@@ -1055,7 +1106,10 @@ def _filter_sympathetic_resonance(
         if peak <= 0:
             continue
         floor = peak * _SYMPATHETIC_RATIO
+        bass_idx = min(cluster, key=lambda i: notes[i]["pitch"]) if bass_exempt else None
         for idx in cluster:
+            if idx == bass_idx:
+                continue  # CQT bass exemption — see docstring
             if notes[idx].get("velocity", 0) < floor:
                 keep_mask[idx] = False
 
@@ -1227,14 +1281,39 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
     A new note joins the current cluster iff:
       - the gap from the most recent note is ≤ ``ONSET_CLUSTER_GAP``, AND
       - the new note's onset is ≤ ``MAX_CLUSTER_DURATION`` after the cluster's
-        first onset (so a slow steady stream of notes doesn't merge forever).
+        first onset (so a slow steady stream of notes doesn't merge forever), AND
+      - its pitch is not already in the cluster.
 
     Otherwise a new cluster is started. Captures strummed chord stabs that
     spread across ~150-250ms while keeping distinct arpeggio attacks apart.
+
+    The duplicate-pitch split exists because one strum cannot strike the
+    same pitch twice: _dedupe_same_pitch_onsets has already merged split
+    detections of a single pluck (within _SAME_PITCH_DEDUPE_WINDOW), so a
+    same-pitch repeat arriving via the rolling gap chain is a sequential
+    re-articulation — a trill or fast repeated melody note — not a chord
+    member. Before this rule, Angie's bridge lick (67/69 alternating every
+    0.07 s at t=1233.4-1234.4) chained into clusters holding the same pitch
+    twice; _enumerate_shapes requires one DISTINCT string per note, found
+    no playable shape, and assign_frets silently discarded the WHOLE
+    cluster as unplayable — 394 real notes (79 clusters) on Angie,
+    including loud G-chord stabs at velocity 95/80/71.
+
+    Two side effects of the split, disclosed deliberately: (1) a trailing
+    quiet same-pitch repeat now starts its OWN cluster, so the
+    sympathetic gate compares it only against its own (possibly
+    all-quiet) members instead of the strum's peak — and singleton
+    clusters skip that gate entirely. On pseudo-velocity runs render's
+    quiet-note floor still catches such tails; on plain basic-pitch runs
+    they survive to the tab. (2) Clusters that previously HAD a playable
+    two-string unison shape (same pitch on two strings) are split too —
+    accepted because a same-pitch repeat outside the dedupe window is
+    far more often a re-articulation than a true unison double-stop.
     """
     indexed = sorted(range(len(notes)), key=lambda i: notes[i]["start"])
     clusters: list[list[int]] = []
     current: list[int] = []
+    current_pitches: set[int] = set()
     cluster_start: float | None = None
     last_onset: float | None = None
     for i in indexed:
@@ -1245,13 +1324,16 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
             and cluster_start is not None
             and (s - last_onset) <= ONSET_CLUSTER_GAP
             and (s - cluster_start) <= MAX_CLUSTER_DURATION
+            and notes[i]["pitch"] not in current_pitches
         )
         if join:
             current.append(i)
+            current_pitches.add(notes[i]["pitch"])
         else:
             if current:
                 clusters.append(current)
             current = [i]
+            current_pitches = {notes[i]["pitch"]}
             cluster_start = s
         last_onset = s
     if current:
@@ -1274,6 +1356,13 @@ def _enumerate_shapes(
     open notes at fret 0) must fit within MAX_HAND_SPAN.
     """
     if not cluster:
+        return []
+    if len(cluster) > NUM_STRINGS:
+        # One distinct string per note: >6 notes can never fit, so skip
+        # the full cartesian product (every combo would fail the
+        # distinct-strings check anyway). Matters because the salvage
+        # drop-loop re-enumerates after each drop — a dense N-note
+        # cluster would otherwise cost O(options^N) per iteration.
         return []
 
     # For each note in the cluster, list its (string, fret) candidates.
@@ -1312,6 +1401,45 @@ def _enumerate_shapes(
     # Limit to the K best shapes per cluster to keep Viterbi tractable.
     shapes.sort(key=lambda x: x.cost)
     return shapes[:32]
+
+
+def _salvage_unplayable_cluster(
+    notes: list[dict],
+    cluster: list[int],
+) -> tuple[list[int], list[Shape], list[tuple[int, str]]]:
+    """Reduce a cluster with no playable shape to its largest playable core.
+
+    _enumerate_shapes() yields nothing when ANY member is out of range on
+    every string, when the members can't fit one-string-each within
+    MAX_HAND_SPAN, or when there are more notes than strings. Discarding the
+    WHOLE cluster then (the old behavior) deleted real notes alongside the
+    blocking artifact — measured on Angie: 394 notes vanished this way,
+    e.g. t=887.8 s where a quiet bass B2 (47@vel14) made the {47, 59, 83}
+    cluster span-unfingerable and took the real B3/B5 (vel 70/67) with it,
+    and t=397.56 s where an out-of-range D2 (38) nuked {50, 62, 78}.
+    Recovery-only: runs ONLY where everything was previously dropped.
+
+      1. Drop members playable on no string — they can never render.
+      2. While no playable shape exists, drop the weakest remaining member
+         (lowest velocity, ties broken toward the higher pitch — quiet
+         upper partials are the usual blockers).
+
+    Returns (kept_indices, kept_shapes, [(dropped_index, reason), ...]).
+    """
+    kept: list[int] = []
+    dropped: list[tuple[int, str]] = []
+    for i in cluster:
+        if _min_playable_fret(notes[i]["pitch"]) is None:
+            dropped.append((i, "Pitch out of range on every string for this tuning."))
+        else:
+            kept.append(i)
+    shapes = _enumerate_shapes(notes, kept) if kept else []
+    while kept and not shapes:
+        weakest = min(kept, key=lambda i: (notes[i].get("velocity", 0), -notes[i]["pitch"]))
+        kept.remove(weakest)
+        dropped.append((weakest, "No playable shape together with the rest of the cluster."))
+        shapes = _enumerate_shapes(notes, kept) if kept else []
+    return kept, shapes, dropped
 
 
 def _chord_shape_bonus(

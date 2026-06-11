@@ -161,6 +161,50 @@ class TestClusterNotesByOnset:
         # The cluster should split at least once — total duration > 0.40s.
         assert len(clusters) >= 2
 
+    def test_repeated_pitch_starts_new_cluster(self):
+        # Regression (Angie bridge_main_lick t=1233.4-1234.4 s): a 67/69
+        # trill at 0.07 s gaps chains into one cluster via the rolling gap;
+        # the repeated pitches made the cluster unfingerable (one distinct
+        # string per note) and the WHOLE cluster — chord stabs included —
+        # was silently dropped as unplayable. A same-pitch repeat is a
+        # sequential re-articulation (dedupe already merged split
+        # detections), so it must start a NEW cluster instead.
+        notes = [
+            {"start": 0.00, "end": 0.07, "pitch": 67, "velocity": 70},
+            {"start": 0.07, "end": 0.14, "pitch": 69, "velocity": 70},
+            {"start": 0.14, "end": 0.21, "pitch": 67, "velocity": 70},  # repeat → split
+            {"start": 0.21, "end": 0.28, "pitch": 69, "velocity": 70},
+        ]
+        clusters = _cluster_notes_by_onset(notes)
+        assert clusters == [[0, 1], [2, 3]]
+        for cluster in clusters:
+            pitches = [notes[i]["pitch"] for i in cluster]
+            assert len(pitches) == len(set(pitches))
+
+    def test_split_quiet_rearticulation_bypasses_sympathetic_gate(self):
+        # Disclosure pin (review nit), not an endorsement: the
+        # duplicate-pitch split severs a trailing quiet same-pitch repeat
+        # from the strum, so the sympathetic gate compares the new cluster
+        # only against its OWN all-quiet peak — pre-split, the single
+        # cluster's floor (95 * 0.5 = 47.5) dropped the quiet pair. On
+        # pseudo-velocity runs render's quiet-note floor still catches
+        # them; on plain basic-pitch runs they now print. Pinned so the
+        # trade-off stays visible if the gate or split changes.
+        notes = [
+            {"start": 0.00, "end": 0.50, "pitch": 55, "velocity": 95},
+            {"start": 0.02, "end": 0.50, "pitch": 67, "velocity": 71},
+            {"start": 0.04, "end": 0.50, "pitch": 62, "velocity": 80},
+            # 67 repeat: 0.09 s after its first strike (outside the dedupe
+            # window) but only 0.07 s after the last onset (inside the
+            # rolling gap) — the pitch rule, not the gap, splits here.
+            {"start": 0.11, "end": 0.20, "pitch": 67, "velocity": 8},
+            {"start": 0.17, "end": 0.25, "pitch": 64, "velocity": 6},
+        ]
+        clusters = _cluster_notes_by_onset(notes)
+        assert clusters == [[0, 1, 2], [3, 4]]
+        filtered, _ = _filter_sympathetic_resonance(notes, clusters)
+        assert len(filtered) == 5  # quiet pair survives against its own peak of 8
+
 
 class TestDedupeSamePitchOnsets:
     def test_keeps_loudest_of_close_duplicates(self):
@@ -252,6 +296,53 @@ class TestFilterSympatheticResonance:
         notes = [{"start": 1.0, "end": 1.5, "pitch": 60, "velocity": 30}]
         filtered_notes, _ = _filter_sympathetic_resonance(notes, [[0]])
         assert len(filtered_notes) == 1
+
+    def test_bass_root_exempt_when_pseudo_velocities(self):
+        # Regression (Angie t=903.2 s open-E7 demo): the REAL low-E pedal
+        # (pitch 40) measured pseudo-velocity 33 vs cluster peak 84 — the
+        # CQT under-measures low strings — and the gate deleted it along
+        # with the genuine phantoms. On pseudo-velocity (MT3 + stem) runs
+        # the caller sets bass_exempt=True and the LOWEST pitch of each
+        # cluster must survive; the gate must still drop quiet NON-bass
+        # members.
+        notes = [
+            {"start": 903.2, "end": 903.5, "pitch": 40, "velocity": 33},  # bass: exempt
+            {"start": 903.2, "end": 903.5, "pitch": 52, "velocity": 80},
+            {"start": 903.2, "end": 903.5, "pitch": 59, "velocity": 84},  # peak
+            {"start": 903.2, "end": 903.5, "pitch": 64, "velocity": 11},  # phantom: drop
+        ]
+        filtered, _ = _filter_sympathetic_resonance(notes, [[0, 1, 2, 3]], bass_exempt=True)
+        assert sorted(n["pitch"] for n in filtered) == [40, 52, 59]
+
+    def test_quiet_bass_dropped_without_pseudo_velocities(self):
+        # The exemption compensates for a CQT low-string bias that
+        # basic-pitch confidence velocities do not have, so by default the
+        # gate must still drop a quiet lowest member: a strong strum makes
+        # the other open strings ring quietly (this filter's core target),
+        # and at velocity 40 this open low E would otherwise clear
+        # render's quiet-note floor (35) and print.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 40, "velocity": 40},  # ring: drop
+            {"start": 1.0, "end": 1.5, "pitch": 76, "velocity": 100},
+            {"start": 1.0, "end": 1.5, "pitch": 79, "velocity": 90},
+        ]
+        filtered, _ = _filter_sympathetic_resonance(notes, [[0, 1, 2]])
+        assert sorted(n["pitch"] for n in filtered) == [76, 79]
+
+    def test_sub_octave_ghost_dropped_without_pseudo_velocities(self):
+        # A basic-pitch sub-octave ghost (p-12 of the real bass) is by
+        # construction the cluster's LOWEST pitch; the overtone gates only
+        # look upward (+12/+19/+24) and the chord-context filter can't
+        # catch it (same pitch class as the real bass) — this gate is the
+        # only defense, so the bass exemption must not shield it on
+        # native-velocity runs.
+        notes = [
+            {"start": 1.0, "end": 1.5, "pitch": 40, "velocity": 20},  # ghost of 52
+            {"start": 1.0, "end": 1.5, "pitch": 52, "velocity": 90},
+            {"start": 1.0, "end": 1.5, "pitch": 59, "velocity": 80},
+        ]
+        filtered, _ = _filter_sympathetic_resonance(notes, [[0, 1, 2]])
+        assert sorted(n["pitch"] for n in filtered) == [52, 59]
 
 
 class TestFilterHarmonicOvertones:
@@ -503,6 +594,195 @@ def test_no_stem_means_no_velocity_and_no_artifacts(tmp_path):
     out = json.loads(paths.frets_json.read_text())
     assert "overtone_artifacts" not in out
     assert out["params"]["audio_evidence"] is False
+    assert all("velocity" not in n for n in out["notes"])
+
+
+def test_trill_chained_into_chord_cluster_survives(tmp_path):
+    """End-to-end regression for the Angie bridge over-deletion: a G-chord
+    stab whose onset chain runs straight into a 67/69 trill previously formed
+    one duplicate-pitch cluster with NO playable shape — assign_frets dropped
+    all of it (chord included) as unplayable. With the duplicate-pitch split
+    every note must survive and nothing may be reported unplayable."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(
+        paths,
+        [
+            {"start": 0.00, "end": 1.0, "pitch": 55, "velocity": 95},
+            {"start": 0.01, "end": 1.0, "pitch": 62, "velocity": 80},
+            {"start": 0.02, "end": 1.0, "pitch": 67, "velocity": 71},
+            {"start": 0.06, "end": 0.12, "pitch": 69, "velocity": 77},
+            # Same-pitch repeats 0.11/0.14 s after their first strikes —
+            # outside _SAME_PITCH_DEDUPE_WINDOW (genuine re-articulations)
+            # but chained into the same onset run by the 0.07 s gaps.
+            {"start": 0.13, "end": 0.19, "pitch": 67, "velocity": 76},  # repeat
+            {"start": 0.20, "end": 0.26, "pitch": 69, "velocity": 73},  # repeat
+        ],
+    )
+    assign_frets(paths, force=True)
+    out = json.loads(paths.frets_json.read_text())
+    assert out["unplayable_clusters"] == []
+    assert sorted(n["pitch"] for n in out["notes"]) == [55, 62, 67, 67, 69, 69]
+
+
+class TestSalvageUnplayableCluster:
+    """A cluster with no playable shape must shed only the blocking members,
+    not delete its real notes wholesale (Angie lost 394 notes this way)."""
+
+    def test_out_of_range_member_no_longer_nukes_cluster(self, tmp_path):
+        # Angie t=397.56 s: an out-of-range D2 (38, below low E) survived the
+        # sympathetic gate via the bass exemption and made the whole cluster
+        # unplayable — deleting the real {50, 62, 78}. Only the 38 may go.
+        # (The exemption is now restricted to stem-backed runs, so this
+        # no-stem test gives the 38 a velocity above the sympathetic floor —
+        # the salvage path must still be the one that removes it.)
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_notes(
+            paths,
+            [
+                {"start": 0.00, "end": 0.5, "pitch": 38, "velocity": 50},
+                {"start": 0.00, "end": 0.5, "pitch": 50, "velocity": 77},
+                {"start": 0.01, "end": 0.5, "pitch": 62, "velocity": 68},
+                {"start": 0.01, "end": 0.5, "pitch": 78, "velocity": 50},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert sorted(n["pitch"] for n in out["notes"]) == [50, 62, 78]
+        assert out["unplayable_clusters"] == []
+        (dropped,) = out["unplayable_notes"]
+        assert dropped["pitch"] == 38
+        assert "out of range" in dropped["reason"]
+
+    def test_unfingerable_quiet_member_dropped_not_cluster(self, tmp_path):
+        # Angie t=887.8 s: quiet bass B2 (47, bass-exempt from the
+        # sympathetic gate on that stem-backed run) cannot be fingered
+        # within MAX_HAND_SPAN of the real B3/B5 (59@70 open, 83@67 fret
+        # 19) — pre-salvage all three vanished. The weakest member goes;
+        # the pair stays. (Velocity raised from the measured 14 to 40 —
+        # above the 35 sympathetic floor — because this no-stem test has
+        # no bass exemption; salvage must do the dropping.)
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_notes(
+            paths,
+            [
+                {"start": 0.00, "end": 0.3, "pitch": 47, "velocity": 40},
+                {"start": 0.00, "end": 0.3, "pitch": 59, "velocity": 70},
+                {"start": 0.01, "end": 0.3, "pitch": 83, "velocity": 67},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert sorted(n["pitch"] for n in out["notes"]) == [59, 83]
+        (dropped,) = out["unplayable_notes"]
+        assert dropped["pitch"] == 47
+        assert "No playable shape" in dropped["reason"]
+
+    def test_seven_note_cluster_keeps_six_strongest(self, tmp_path):
+        # More distinct pitches than strings: keep a playable 6 (equal
+        # velocities tie-break toward dropping the highest pitch).
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_notes(
+            paths,
+            [
+                {"start": i * 0.01, "end": 0.5, "pitch": p, "velocity": 100}
+                for i, p in enumerate([40, 45, 50, 55, 59, 64, 65])
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert sorted(n["pitch"] for n in out["notes"]) == [40, 45, 50, 55, 59, 64]
+        (dropped,) = out["unplayable_notes"]
+        assert dropped["pitch"] == 65
+
+    def test_singleton_out_of_range_still_whole_cluster_unplayable(self, tmp_path):
+        # Nothing to salvage in a 1-note cluster — old path preserved.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_notes(paths, [{"start": 0.0, "end": 0.5, "pitch": 24, "velocity": 100}])
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert out["notes"] == []
+        assert out["unplayable_notes"] == []
+        assert len(out["unplayable_clusters"]) == 1
+
+    def test_all_members_out_of_range_falls_back_to_whole_cluster(self, tmp_path):
+        # Salvage returns kept=[] when EVERY member is out of range; the
+        # `if kept:` guard must fall through to the old whole-cluster
+        # unplayable_clusters record and emit NO unplayable_notes entries
+        # (the per-note records exist only when cluster-mates were saved).
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        _write_notes(
+            paths,
+            [
+                {"start": 0.00, "end": 0.5, "pitch": 20, "velocity": 100},
+                {"start": 0.01, "end": 0.5, "pitch": 24, "velocity": 100},
+            ],
+        )
+        assign_frets(paths, force=True)
+        out = json.loads(paths.frets_json.read_text())
+        assert out["notes"] == []
+        assert out["unplayable_notes"] == []
+        (cluster,) = out["unplayable_clusters"]
+        assert sorted(cluster["pitches"]) == [20, 24]
+
+
+def test_params_record_backend_provenance(tmp_path):
+    """frets.json params must name the backend whose notes were actually
+    used plus the source file, so verify's agreement tiers can label
+    correctly instead of assuming mt3."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(paths, [{"start": 0.0, "end": 0.5, "pitch": 60, "velocity": 100}])
+    assign_frets(paths, force=True)
+    out = json.loads(paths.frets_json.read_text())
+    assert out["params"]["backend"] == "mt3"
+    assert out["params"]["source_notes_file"] == paths.notes_mt3_json.name
+
+
+def test_params_backend_reflects_fallback(tmp_path):
+    """Requesting mt3 with only notes.json on disk falls back to
+    basic_pitch — provenance must record what was USED, not what was
+    asked for."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    paths.notes_json.write_text(
+        json.dumps({"notes": [{"start": 0.0, "end": 0.5, "pitch": 60, "velocity": 100}]})
+    )
+    assign_frets(paths, force=True, backend="mt3")
+    out = json.loads(paths.frets_json.read_text())
+    assert out["params"]["backend"] == "basic_pitch"
+    assert out["params"]["source_notes_file"] == paths.notes_json.name
+
+
+def test_params_backend_reflects_fallback_to_mt3(tmp_path):
+    """The reverse fallback direction: requesting basic_pitch with only
+    notes.mt3.json on disk must record mt3 as the backend actually used."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    _write_notes(paths, [{"start": 0.0, "end": 0.5, "pitch": 60, "velocity": 100}])
+    assign_frets(paths, force=True, backend="basic_pitch")
+    out = json.loads(paths.frets_json.read_text())
+    assert out["params"]["backend"] == "mt3"
+    assert out["params"]["source_notes_file"] == paths.notes_mt3_json.name
+
+
+def test_basic_pitch_no_stem_quiet_bass_still_gated(tmp_path):
+    """End-to-end guard for the bass-exemption scope (major review fix):
+    a no-stem basic-pitch run writes NO velocities into frets.json, so
+    render has no quiet-note backstop — the sympathetic gate itself must
+    keep dropping the quiet lowest cluster member there. The exemption is
+    reserved for CQT pseudo-velocity (MT3 + stem) runs."""
+    paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+    paths.notes_json.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {"start": 1.00, "end": 1.5, "pitch": 40, "velocity": 40},
+                    {"start": 1.01, "end": 1.5, "pitch": 76, "velocity": 100},
+                    {"start": 1.02, "end": 1.5, "pitch": 79, "velocity": 90},
+                ]
+            }
+        )
+    )
+    assign_frets(paths, force=True, backend="basic_pitch")
+    out = json.loads(paths.frets_json.read_text())
+    assert sorted(n["pitch"] for n in out["notes"]) == [76, 79]
     assert all("velocity" not in n for n in out["notes"])
 
 

@@ -4,12 +4,28 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from migs_tab.paths import VideoPaths
 from migs_tab.render import (
+    TuningInfo,
     _apply_verified_chord_shapes,
     _in_any_time_range,
     _load_verified_chord_shapes,
+    _tab_string_letters_for_tuning,
 )
+
+
+def _tuning(strings_midi=None, capo=0):
+    strings = strings_midi or [40, 45, 50, 55, 59, 64]
+    return TuningInfo(
+        label="Standard" if capo == 0 else f"Standard, capo {capo}",
+        capo=capo,
+        strings_midi=strings,
+        source="audio",
+        confidence=1.0,
+        string_letters=_tab_string_letters_for_tuning(strings),
+    )
 
 
 class TestInAnyTimeRange:
@@ -159,4 +175,94 @@ class TestApplyVerifiedChordShapes:
         }
         result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified)
         # No override applied.
+        assert result[0]["fret"] == 5
+
+
+class TestVerifiedShapesWithoutMidiPitch:
+    """The SKILL.md-documented format omits midi_pitch — it must be derived
+    from the tuning, not silently no-op (the old code swallowed the KeyError
+    and a doc-conformant file did nothing)."""
+
+    def test_doc_format_applies_via_derived_pitch(self):
+        # Open A string in standard tuning sounds MIDI 45. The doc format
+        # carries only {string, fret}; the renderer derives the pitch.
+        notes = [{"start": 1.0, "pitch": 45, "string": 0, "fret": 5}]
+        verified = {
+            "verified": {
+                "Am": {
+                    "voicing": [{"string": 1, "fret": 0}],
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified, _tuning())
+        assert result[0]["string"] == 1
+        assert result[0]["fret"] == 0
+        assert result[0]["overridden_by"] == "verified-shape:Am"
+
+    def test_derivation_accounts_for_capo(self):
+        # Capo 5: open low E sounds A2 (40 + 5 = 45). Frets are capo-relative.
+        notes = [{"start": 1.0, "pitch": 45, "string": 1, "fret": 0}]
+        verified = {
+            "verified": {
+                "Am": {
+                    "voicing": [{"string": 0, "fret": 0}],
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified, _tuning(capo=5))
+        assert result[0]["string"] == 0
+        assert result[0]["fret"] == 0
+
+    def test_malformed_entry_warns_instead_of_silence(self):
+        notes = [{"start": 1.0, "pitch": 45, "string": 0, "fret": 5}]
+        verified = {
+            "verified": {
+                "Am": {
+                    "voicing": [{"fret": 0}],  # no string — malformed
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        with pytest.warns(UserWarning, match="missing a valid 'string'/'fret'"):
+            result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified, _tuning())
+        assert result[0]["fret"] == 5  # untouched, but loudly so
+
+    def test_no_tuning_and_no_midi_pitch_warns(self):
+        notes = [{"start": 1.0, "pitch": 45, "string": 0, "fret": 5}]
+        verified = {
+            "verified": {
+                "Am": {
+                    "voicing": [{"string": 1, "fret": 0}],
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        with pytest.warns(UserWarning, match="no tuning is available"):
+            result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified)
+        assert result[0]["fret"] == 5
+
+    def test_declared_pitch_inconsistent_with_tuning_warns(self):
+        notes = [{"start": 1.0, "pitch": 57, "string": 3, "fret": 2}]
+        verified = {
+            "verified": {
+                "Am": {
+                    # string 1 fret 0 sounds 45, not the declared 57.
+                    "voicing": [{"string": 1, "fret": 0, "midi_pitch": 57}],
+                    "applies_to": "all_spans",
+                }
+            }
+        }
+        with pytest.warns(UserWarning, match="declares midi_pitch 57"):
+            result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified, _tuning())
+        # The declared pitch still keys the lookup (vision verified the shape).
+        assert result[0]["string"] == 1
+        assert result[0]["fret"] == 0
+
+    def test_non_list_voicing_warns(self):
+        notes = [{"start": 1.0, "pitch": 45, "string": 0, "fret": 5}]
+        verified = {"verified": {"Am": {"voicing": "open Am"}}}
+        with pytest.warns(UserWarning, match="non-list 'voicing'"):
+            result = _apply_verified_chord_shapes(notes, [(0.0, 5.0, "Am")], verified, _tuning())
         assert result[0]["fret"] == 5

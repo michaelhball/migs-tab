@@ -17,13 +17,15 @@ before, and gives an implicit feel for the song's rhythm.
 from __future__ import annotations
 
 import json
+import warnings
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import librosa
 import numpy as np
 
+from .annotations import compute_section_hints
 from .paths import DEFAULT_OUTPUT_DIR, VideoPaths
 
 # ---------------------------------------------------------------------------
@@ -71,18 +73,29 @@ _SKIP_LABELS = {"closing_remarks"}
 # notes the player meant to land.
 _MIN_NOTE_DURATION = 0.08  # drop notes shorter than this (~ a single hop)
 _MIN_NOTE_VELOCITY = 35  # drop notes quieter than this on the 0..127 scale
-_DEDUPE_WINDOW = 0.10  # drop duplicate same-pitch notes within this many seconds
-
-# Sustain detection: a note whose onset falls inside (a slightly contracted
-# version of) an earlier same-pitch note's duration is treated as a
-# re-detection of that ringing string rather than a fresh pluck.
-_SUSTAIN_CONTRACTION = 0.05  # subtract this from the earlier note's end
+# Duplicate-onset suppression: same-pitch onsets within this window are
+# re-detections of one pluck; the louder (then longer) of the pair is kept.
+# Onset distance is the ONLY criterion — the old sustain filter (drop any
+# onset inside the previous note's span) deleted genuine re-articulations,
+# because MT3 emits generously long ringing durations: a 5s strummed-E
+# demo rendered as ONE note.
+_DEDUPE_WINDOW = 0.10
 
 # Cross-instance voting: a canonical-instance note is kept only if its
 # (chord_name, pitch_class) pair appears in at least this many *other*
 # instances of the same section. 1 = "at least one other take confirms".
 # Skipped entirely for sections with only one instance.
 _CROSS_INSTANCE_MIN_SUPPORT = 1
+
+# Cross-instance voting loud-note bypass: notes at/above this velocity are
+# kept even with no support from another take.
+_LOUD_VELOCITY_KEEP = 75
+# frets.json notes carry NO velocity field today: MT3 emits constant
+# velocity 100 at the raw MIDI level and the frets pipeline doesn't
+# propagate basic-pitch's. Until the salience integration lands and
+# populates an energy-proxy velocity, a missing velocity must mean "keep"
+# — hence a sentinel above any real 0..127 value.
+_VELOCITY_WHEN_ABSENT = 999
 
 # Demo-quality ranking when picking a canonical instance.
 _DEMO_QUALITY_RANK = {
@@ -91,6 +104,18 @@ _DEMO_QUALITY_RANK = {
     "repeated-loop": 2,
     "partial": 1,
 }
+
+# Cap per-section layout footnotes; beyond this they collapse into a
+# single "+N more" line so collision-heavy sections don't bury the tab
+# (mirrors annotations._MAX_HINTS_PER_SECTION).
+_MAX_LAYOUT_NOTES_PER_SECTION = 8
+
+# When a cluster snaps onto an occupied subdivision slot, scan forward at
+# most this many slots for a free one (3 slots = 1.5 beats at 8th-note
+# granularity). Drifting an onset further than that misrepresents the
+# rhythm worse than a shared cell does — beyond the budget the clusters
+# share the cell and a footnote is emitted.
+_MAX_SLOT_SHIFT = 3
 
 # Beat-tracking + quantization parameters.
 _BEAT_SR = 22050
@@ -121,6 +146,12 @@ class RenderedSection:
     note_count: int
     ascii_tab: str
     tempo_bpm: float
+    hints: list[str] = field(default_factory=list)
+    # Beat-grid slot collisions: how many clusters snapped onto an already-
+    # occupied subdivision slot, plus footnotes for same-string drops and
+    # cross-string merges the forward scan could not resolve.
+    slot_collisions: int = 0
+    layout_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -181,7 +212,10 @@ def render(
     out_dir = paths.output_dir(output_root)
     tab_path = out_dir / "tab.txt"
     md_path = out_dir / "tab.md"
-    if tab_path.exists() and not force:
+    # Reuse existing outputs only when they are at least as new as every
+    # input artifact — a bare existence check let users keep reading stale
+    # tabs after upstream fixes re-wrote frets.json / tuning.json / etc.
+    if not force and _outputs_fresh(paths, tab_path, md_path):
         return tab_path
 
     if paths.sections_json.exists():
@@ -197,13 +231,17 @@ def render(
     notes = _apply_overrides(frets_data["notes"], overrides)
     notes = _filter_noise(notes)
 
+    tuning_info = TuningInfo.from_paths(paths)
+
     # Vision-verified chord shapes — for each note whose chord context has a
     # verified (string, fret) voicing, override the algorithm's assignment.
     chord_spans = _load_chord_spans_for_render(paths)
     verified_shapes = _load_verified_chord_shapes(paths)
-    notes = _apply_verified_chord_shapes(notes, chord_spans, verified_shapes)
+    notes = _apply_verified_chord_shapes(notes, chord_spans, verified_shapes, tuning_info)
 
-    tuning_info = TuningInfo.from_paths(paths)
+    # Secondary-backend notes for ornament hints. If MT3 drove the tab, the
+    # secondary is basic-pitch and vice versa. Missing = no hints, fine.
+    secondary_notes = _load_secondary_notes_for_hints(paths)
 
     # Build cross-instance pitch-class support per section, so we can drop
     # canonical-instance notes that no other take confirms.
@@ -241,13 +279,20 @@ def render(
         )
         notes_by_section[section["label"]] = section_notes
         beat_times_by_section[section["label"]] = beat_times
-        ascii_tab = _render_section_tab(
+        ascii_tab, slot_collisions, layout_notes = _render_section_tab(
             section_notes,
             line_width=line_width,
             beat_times=beat_times,
             string_letters=tuning_info.string_letters,
         )
         clusters_in_section = {n["cluster_id"] for n in section_notes}
+        hints = (
+            compute_section_hints(
+                canonical["start"], canonical["end"], section_notes, secondary_notes
+            )
+            if secondary_notes
+            else []
+        )
         rendered.append(
             RenderedSection(
                 label=section["label"],
@@ -259,6 +304,9 @@ def render(
                 note_count=len(section_notes),
                 ascii_tab=ascii_tab,
                 tempo_bpm=tempo_bpm,
+                hints=hints,
+                slot_collisions=slot_collisions,
+                layout_notes=layout_notes,
             )
         )
 
@@ -289,6 +337,41 @@ def render(
 
 
 # ---------------------------------------------------------------------------
+# Output freshness
+# ---------------------------------------------------------------------------
+
+
+def _render_input_paths(paths: VideoPaths) -> list[Path]:
+    """Every cache artifact render() consumes. Optional ones (overrides,
+    verified shapes, tuning, secondary notes) are listed too — when they
+    appear or change, the rendered tab must change with them."""
+    return [
+        paths.frets_json,
+        paths.sections_json,
+        paths.structure_json,
+        paths.frets_overrides_json,
+        paths.chord_shapes_verified_json,
+        paths.tuning_json,
+        paths.notes_json,  # secondary backend, drives the ornament hints
+        paths.guitar_stem,  # beat grids via _detect_beats
+    ]
+
+
+def _newest_input_mtime(paths: VideoPaths) -> float:
+    mtimes = [p.stat().st_mtime for p in _render_input_paths(paths) if p.exists()]
+    return max(mtimes) if mtimes else 0.0
+
+
+def _outputs_fresh(paths: VideoPaths, tab_path: Path, md_path: Path) -> bool:
+    """True when both rendered outputs exist and are at least as new as
+    every input artifact, i.e. it is safe to skip re-rendering."""
+    if not (tab_path.exists() and md_path.exists()):
+        return False
+    output_mtime = min(tab_path.stat().st_mtime, md_path.stat().st_mtime)
+    return output_mtime >= _newest_input_mtime(paths)
+
+
+# ---------------------------------------------------------------------------
 # Vision-verified chord-shape overrides
 # ---------------------------------------------------------------------------
 
@@ -301,7 +384,7 @@ def _load_verified_chord_shapes(paths: VideoPaths) -> dict:
       "verified": {
         "<chord_name>": {
           "voicing": [
-            {"midi_pitch": <int>, "string": <0..5>, "fret": <int>},
+            {"string": <0..5>, "fret": <int>, "midi_pitch": <int, optional>},
             ...
           ],
           "applies_to": "all_spans"  |  [{"start": ..., "end": ...}, ...],
@@ -309,6 +392,10 @@ def _load_verified_chord_shapes(paths: VideoPaths) -> dict:
         }
       }
     }
+
+    ``midi_pitch`` is optional-but-recommended: when absent it is derived
+    from the detected tuning as ``strings_midi[string] + capo + fret``
+    (frets.json frets are capo-relative, pitches are sounding pitches).
 
     Older narrative-style files (without an explicit ``voicing`` list per
     chord) are loaded but have no effect — we ignore entries that don't
@@ -326,6 +413,7 @@ def _apply_verified_chord_shapes(
     notes: list[dict],
     chord_spans: list[tuple[float, float, str]],
     verified_data: dict,
+    tuning: TuningInfo | None = None,
 ) -> list[dict]:
     """Override (string, fret) for notes whose chord context has a verified
     voicing for their pitch.
@@ -335,6 +423,12 @@ def _apply_verified_chord_shapes(
     voicing covers this exact MIDI pitch AND the note's time falls inside
     the verified entry's ``applies_to`` scope, replace the algorithm's
     (string, fret) with the verified ones.
+
+    ``midi_pitch`` is optional in voicing entries: when absent it is
+    derived from the tuning (``strings_midi[string] + capo + fret``), so
+    the SKILL.md-documented {string, fret} format works. Malformed entries
+    emit a UserWarning instead of being silently dropped — a verified file
+    that silently does nothing is worse than a noisy one.
     """
     if not verified_data or not chord_spans:
         return notes
@@ -347,14 +441,58 @@ def _apply_verified_chord_shapes(
     applies_to_by_chord: dict[str, list[dict] | str] = {}
     for chord, entry in verified_map.items():
         voicing = entry.get("voicing")
+        if voicing is None:
+            continue  # narrative-style entry, intentionally inert
         if not isinstance(voicing, list):
+            warnings.warn(
+                f"chord-shapes-verified: '{chord}' has a non-list 'voicing' "
+                f"({type(voicing).__name__}); entry ignored.",
+                stacklevel=2,
+            )
             continue
         lookup: dict[int, tuple[int, int]] = {}
         for v in voicing:
             try:
-                lookup[int(v["midi_pitch"])] = (int(v["string"]), int(v["fret"]))
+                string = int(v["string"])
+                fret = int(v["fret"])
             except (KeyError, TypeError, ValueError):
+                warnings.warn(
+                    f"chord-shapes-verified: '{chord}' voicing entry {v!r} is "
+                    "missing a valid 'string'/'fret'; entry ignored.",
+                    stacklevel=2,
+                )
                 continue
+            derived = _derive_midi_pitch(tuning, string, fret)
+            declared = v.get("midi_pitch")
+            if declared is not None:
+                try:
+                    pitch = int(declared)
+                except (TypeError, ValueError):
+                    warnings.warn(
+                        f"chord-shapes-verified: '{chord}' voicing entry {v!r} "
+                        f"has a non-integer 'midi_pitch'; entry ignored.",
+                        stacklevel=2,
+                    )
+                    continue
+                if derived is not None and pitch != derived:
+                    warnings.warn(
+                        f"chord-shapes-verified: '{chord}' voicing entry {v!r} "
+                        f"declares midi_pitch {pitch} but string {string} fret "
+                        f"{fret} sounds as {derived} under the detected tuning "
+                        "— the declared pitch is used, but check the entry.",
+                        stacklevel=2,
+                    )
+            elif derived is not None:
+                pitch = derived
+            else:
+                warnings.warn(
+                    f"chord-shapes-verified: '{chord}' voicing entry {v!r} has "
+                    "no 'midi_pitch' and no tuning is available to derive it; "
+                    "entry ignored.",
+                    stacklevel=2,
+                )
+                continue
+            lookup[pitch] = (string, fret)
         if lookup:
             by_chord[chord] = lookup
             applies_to_by_chord[chord] = entry.get("applies_to", "all_spans")
@@ -380,6 +518,20 @@ def _apply_verified_chord_shapes(
         if not applied:
             out.append(n)
     return out
+
+
+def _derive_midi_pitch(tuning: TuningInfo | None, string: int, fret: int) -> int | None:
+    """Sounding MIDI pitch of (string, fret) under the detected tuning.
+
+    frets.json frets are relative to the capo and pitches are sounding
+    pitches, so: ``strings_midi[string] + capo + fret`` (matches
+    fret._load_tuning, which adds the capo to every open string).
+    Returns None when the tuning is unavailable or the string index is
+    out of range.
+    """
+    if tuning is None or not (0 <= string < len(tuning.strings_midi)):
+        return None
+    return tuning.strings_midi[string] + tuning.capo + fret
 
 
 def _in_any_time_range(ranges, t: float) -> bool:
@@ -529,6 +681,24 @@ def _sections_from_structure(structure_json_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _load_secondary_notes_for_hints(paths: VideoPaths) -> list[dict]:
+    """Read notes from whichever backend did NOT drive the tab, for ornament hints.
+
+    Currently we always use basic-pitch's notes.json as the secondary. The
+    frets pipeline reads MT3 by default; basic-pitch's note list lives at
+    paths.notes_json. Missing → return [] (no hints emitted).
+    """
+    if not paths.notes_json.exists():
+        return []
+    try:
+        data = json.loads(paths.notes_json.read_text())
+        notes = data.get("notes", [])
+        # Defensive: tolerate either basic-pitch or MT3 schema.
+        return [n for n in notes if "start" in n and "pitch" in n and "end" in n]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def _load_chord_spans_for_render(paths: VideoPaths) -> list[tuple[float, float, str]]:
     """Same shape as fret._load_chord_spans, loaded here for cross-instance
     voting. Returns [] if structure.json is missing."""
@@ -598,9 +768,9 @@ def _apply_cross_instance_support(
     instance_count: int,
 ) -> list[dict]:
     """Drop notes whose exact (chord, pitch) is in fewer than
-    ``cross_support_min + 1`` instances. Loud notes (velocity ≥ 75)
-    survive even without cross-instance backup — the canonical's
-    confidence on its own is decisive."""
+    ``cross_support_min + 1`` instances. Loud notes (velocity ≥
+    ``_LOUD_VELOCITY_KEEP``) survive even without cross-instance backup —
+    the canonical's confidence on its own is decisive."""
     if instance_count < 2 or not pair_supports:
         return section_notes
     threshold = cross_support_min + 1  # canonical counts as one
@@ -614,7 +784,10 @@ def _apply_cross_instance_support(
         support = pair_supports.get(pair, 0)
         if support >= threshold:
             survivors.append(n)
-        elif n.get("velocity", 999) >= 75:
+        # Velocity is absent from frets.json today (see _VELOCITY_WHEN_ABSENT)
+        # so this gate keeps every unsupported note until the salience
+        # integration populates energy-proxy velocities. Do not remove it.
+        elif n.get("velocity", _VELOCITY_WHEN_ABSENT) >= _LOUD_VELOCITY_KEEP:
             survivors.append(n)
     return survivors
 
@@ -726,18 +899,26 @@ def _subdivisions_from_beats(beat_times: list[float]) -> list[tuple[float, bool]
 
 
 def _filter_noise(notes: list[dict]) -> list[dict]:
-    """Drop short, quiet, duplicate, or sustained-continuation notes."""
+    """Drop short, quiet, or duplicate-onset notes."""
     survivors: list[dict] = []
     for n in notes:
         dur = n.get("end", n["start"]) - n["start"]
         if dur < _MIN_NOTE_DURATION:
             continue
+        # Quiet-note floor. frets.json notes carry NO velocity field today
+        # (MT3 emits constant velocity 100), so this gate is a no-op until
+        # the salience integration lands and adds energy-proxy velocities.
+        # Keep it: basic-pitch-backed runs DO have real velocities.
         vel = n.get("velocity")
         if vel is not None and vel < _MIN_NOTE_VELOCITY:
             continue
         survivors.append(n)
 
-    # Dedupe close-onset same-pitch detections, prefer the louder/longer.
+    # Duplicate-onset suppression: same-pitch onsets within _DEDUPE_WINDOW
+    # of the last kept same-pitch onset are re-detections of one pluck —
+    # keep the louder (then longer) of the pair, NOT necessarily the first.
+    # Same-pitch onsets further apart than the window always survive, so
+    # re-picking a ringing string or re-strumming a chord is never dropped.
     survivors.sort(key=lambda n: (n["pitch"], n["start"]))
     deduped: list[dict] = []
     last_by_pitch: dict[int, dict] = {}
@@ -753,22 +934,8 @@ def _filter_noise(notes: list[dict]) -> list[dict]:
         deduped.append(n)
         last_by_pitch[n["pitch"]] = n
 
-    # Sustain detection: scan in time order. For each note, look at the most
-    # recent same-pitch note that we kept; if THIS note's onset falls inside
-    # (prev.start, prev.end - _SUSTAIN_CONTRACTION), the new "onset" is most
-    # likely a re-detection of the still-ringing string, so drop it.
     deduped.sort(key=lambda n: (n["start"], n["pitch"]))
-    out: list[dict] = []
-    last_kept_by_pitch: dict[int, dict] = {}
-    for n in deduped:
-        prev = last_kept_by_pitch.get(n["pitch"])
-        if prev is not None:
-            prev_end_contracted = prev.get("end", prev["start"]) - _SUSTAIN_CONTRACTION
-            if prev["start"] < n["start"] < prev_end_contracted:
-                continue
-        out.append(n)
-        last_kept_by_pitch[n["pitch"]] = n
-    return out
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -848,16 +1015,22 @@ def _render_section_tab(
     line_width: int,
     beat_times: list[float],
     string_letters: list[str] | None = None,
-) -> str:
+) -> tuple[str, int, list[str]]:
     """Render section's notes as a beat-aligned 6-line ASCII tab.
 
     The visible columns correspond to 8th-note subdivisions of the
     detected beat grid. Cluster onsets are snapped to the nearest
     subdivision. Beat downbeats are marked with a wider separator;
     every ``_BEATS_PER_BAR`` beats a bar line `|` is drawn.
+
+    Returns ``(ascii_tab, slot_collisions, layout_notes)``: how many
+    clusters snapped onto an already-occupied slot (most are resolved by
+    shifting forward to the next free slot), plus footnotes for notes
+    dropped by same-string conflicts and for distinct onsets that still
+    share a cell cross-string after the forward scan.
     """
     if not section_notes:
-        return ""
+        return "", 0, []
 
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for n in section_notes:
@@ -869,14 +1042,32 @@ def _render_section_tab(
     grid = _subdivisions_from_beats(beat_times)
     if not grid:
         # Beat detection produced nothing usable — fall back to event-ordered.
-        return _render_event_ordered(by_cluster, cluster_ids, line_width, letters)
+        return _render_event_ordered(by_cluster, cluster_ids, line_width, letters), 0, []
 
-    # Map each cluster to its nearest grid slot.
+    # Map each cluster to its nearest grid slot. Two clusters snapping onto
+    # the same slot used to merge silently (same-string notes last-write-
+    # won, so separate plucks fused into never-played chords). Now a
+    # later-onset cluster is bumped forward to the NEXT FREE subdivision
+    # slot within _MAX_SLOT_SHIFT. Clusters are placed in onset order and
+    # the scan only moves forward, so bumped clusters can cascade (3rd
+    # cluster lands 2 slots over) without ever inverting onset order.
+    # When no slot in budget is free the clusters share the cell; per-
+    # string conflicts and cross-string merges are footnoted below.
     grid_times = [t for t, _ in grid]
+    section_t0 = grid_times[0]
     cluster_at_slot: dict[int, list[dict]] = defaultdict(list)
+    slot_collisions = 0
+    layout_notes: list[str] = []
     for cid in cluster_ids:
         t = min(n["start"] for n in by_cluster[cid])
         slot = _nearest_index(grid_times, t)
+        if slot in cluster_at_slot:
+            slot_collisions += 1
+            limit = min(slot + _MAX_SLOT_SHIFT, len(grid_times) - 1)
+            for candidate in range(slot + 1, limit + 1):
+                if candidate not in cluster_at_slot:
+                    slot = candidate
+                    break
         cluster_at_slot[slot].extend(by_cluster[cid])
 
     # Build a cell per grid slot (most are empty rests).
@@ -885,9 +1076,34 @@ def _render_section_tab(
     beat_count = 0
     for slot_idx, (_, is_beat) in enumerate(grid):
         cell = ["-"] * 6
-        notes_here = cluster_at_slot.get(slot_idx, [])
-        for n in notes_here:
+        kept_by_line: dict[int, dict] = {}
+        for n in cluster_at_slot.get(slot_idx, []):
             line_idx = 5 - n["string"]
+            prev = kept_by_line.get(line_idx)
+            if prev is None:
+                kept_by_line[line_idx] = n
+                continue
+            kept, dropped = _slot_winner(prev, n)
+            kept_by_line[line_idx] = kept
+            layout_notes.append(
+                f"same-string conflict at +{dropped['start'] - section_t0:.1f}s — "
+                f"string {letters[line_idx]}: kept fret {kept['fret']}, "
+                f"dropped fret {dropped['fret']} (two notes on one string "
+                "in the same grid slot)"
+            )
+        # Distinct clusters still sharing one cell after the forward scan
+        # would be drawn as a single chord the player never strummed —
+        # never let that happen silently.
+        kept_clusters = {n["cluster_id"] for n in kept_by_line.values()}
+        if len(kept_clusters) > 1:
+            cell_t = min(n["start"] for n in kept_by_line.values())
+            layout_notes.append(
+                f"cross-string merge at +{cell_t - section_t0:.1f}s — "
+                f"{len(kept_clusters)} separate onsets share one cell (no "
+                f"free slot within {_MAX_SLOT_SHIFT} subdivisions); drawn "
+                "as a single chord"
+            )
+        for line_idx, n in kept_by_line.items():
             cell[line_idx] = str(n["fret"])
         cell_width = max(len(c) for c in cell)
         cell = [c.rjust(cell_width, "-") for c in cell]
@@ -898,7 +1114,23 @@ def _render_section_tab(
         else:
             slot_markers.append("")
 
-    return _pack_quantized(raw_cells, slot_markers, line_width, letters)
+    if len(layout_notes) > _MAX_LAYOUT_NOTES_PER_SECTION:
+        extra = len(layout_notes) - _MAX_LAYOUT_NOTES_PER_SECTION
+        layout_notes = layout_notes[:_MAX_LAYOUT_NOTES_PER_SECTION]
+        layout_notes.append(f"… (+{extra} more layout conflicts)")
+    tab = _pack_quantized(raw_cells, slot_markers, line_width, letters)
+    return tab, slot_collisions, layout_notes
+
+
+def _slot_winner(a: dict, b: dict) -> tuple[dict, dict]:
+    """Pick which of two same-string, same-slot notes survives: the
+    earlier onset wins; at equal onsets the longer note wins. Returns
+    ``(kept, dropped)``."""
+
+    def key(n: dict) -> tuple[float, float]:
+        return (n["start"], -(n.get("end", n["start"]) - n["start"]))
+
+    return (a, b) if key(a) <= key(b) else (b, a)
 
 
 def _render_event_ordered(
@@ -1050,11 +1282,12 @@ def _format_full_tab(
     )
     lines.append("")
     for sec in rendered:
+        collision_note = f", {sec.slot_collisions} slot collision(s)" if sec.slot_collisions else ""
         lines.append("=" * 72)
         lines.append(
             f"[{sec.label}]   {sec.canonical_start:.1f}-{sec.canonical_end:.1f}s "
             f"({sec.note_count} notes, {sec.cluster_count} clusters, "
-            f"~{sec.tempo_bpm:.0f} bpm)"
+            f"~{sec.tempo_bpm:.0f} bpm{collision_note})"
         )
         if sec.chord_progression:
             lines.append(f"chords: {'  '.join(sec.chord_progression[:16])}")
@@ -1065,6 +1298,16 @@ def _format_full_tab(
                 lines.append(chunk)
         lines.append("")
         lines.append(sec.ascii_tab)
+        if sec.layout_notes:
+            lines.append("")
+            lines.append("layout notes (beat-grid collisions):")
+            for note in sec.layout_notes:
+                lines.append(f"  • {note}")
+        if sec.hints:
+            lines.append("")
+            lines.append("basic-pitch hints (ornaments MT3 simplified out):")
+            for h in sec.hints:
+                lines.append(f"  • {h}")
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -1087,17 +1330,31 @@ def _format_markdown(
     if summary:
         parts.append(f"_{summary}_\n")
     for sec in rendered:
+        collision_note = (
+            f" · {sec.slot_collisions} slot collision(s)" if sec.slot_collisions else ""
+        )
         parts.append(f"## {sec.label}")
         parts.append(
             f"_{sec.canonical_start:.1f}-{sec.canonical_end:.1f}s · "
-            f"{sec.note_count} notes · ~{sec.tempo_bpm:.0f} bpm · "
+            f"{sec.note_count} notes · ~{sec.tempo_bpm:.0f} bpm{collision_note} · "
             f"chords: {' '.join(sec.chord_progression[:16])}_\n"
         )
         if sec.description:
             parts.append(sec.description + "\n")
         parts.append("```")
         parts.append(sec.ascii_tab)
-        parts.append("```\n")
+        parts.append("```")
+        if sec.layout_notes:
+            parts.append("\n**layout notes** _(beat-grid collisions)_:\n")
+            for note in sec.layout_notes:
+                parts.append(f"- {note}")
+            parts.append("")
+        if sec.hints:
+            parts.append("\n**basic-pitch hints** _(ornaments MT3 simplified out)_:\n")
+            for h in sec.hints:
+                parts.append(f"- {h}")
+            parts.append("")
+        parts.append("")
     return "\n".join(parts)
 
 

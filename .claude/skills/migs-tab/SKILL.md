@@ -180,15 +180,34 @@ Workflow:
    ```
    Writes `cache/<id>/frames/<subdir>/t<seconds>_cluster<id>.jpg`.
 
-3. **Read each frame with the Read tool.** For each frame:
-   - Identify which fret region the visible hand is in. The dot inlays on the
-     fretboard are reliable anchors: single dots at frets 3, 5, 7, 9, then a
-     double dot at fret 12 (on most acoustics).
-   - Decide whether the algorithm's chosen (string, fret) is consistent with
-     the visible hand position, or whether one of the listed `alternatives`
-     fits better.
+3. **Read each frame with the Read tool, but FIRST orient yourself.**
+
+   **CRITICAL — fretboard orientation, do not skip:**
+   - Find the guitar **body** in the frame. On a typical seated-instructor
+     framing the body is at image-LEFT (cutaway/soundhole/pickguard visible).
+   - Find the **headstock** (or its direction): typically image-RIGHT.
+   - **LOW frets (1, 2, 3) are near the headstock. HIGH frets (12+) are near
+     the body.** This is opposite to the naive intuition that "high on the
+     neck = high fret number." It is not — "high on the neck" means *near the
+     headstock*, which is fret 1.
+   - The dot inlays anchor your counting: single dots at 3, 5, 7, 9, then a
+     double-dot at 12 (on most acoustics), single again at 15, 17.
+
+   **Then do an audio cross-check before committing.** A visual fret claim
+   has an implied pitch range. Read `notes.mt3.json` (or `notes.json`) and
+   filter to the cluster's time window. If your visual reading puts the hand
+   at fret 12 but MT3 detects pitches in the A2–E4 range, the visual reading
+   is wrong — those pitches require fret 0–5 positions. Refuse to commit and
+   re-examine. (Cowboy Am pitches ≈ 45–69 / A2–A4; high-position Am at fret
+   12 ≈ 57–81 / A3–A5. A factor-of-2 octave shift is the hard tell.)
+
+   - Once oriented + audio-cross-checked, decide whether the algorithm's
+     chosen (string, fret) is consistent with the visible hand position, or
+     whether one of the listed `alternatives` fits better.
    - If the hand is mid-transition (no fingers pressed), abstain — do not
      override the algorithm. Note this in your output.
+   - If the visual reading and audio cross-check disagree, abstain — say
+     which one is suspect and why.
 
 4. **Write `cache/<id>/frets.overrides.json`** with the corrections:
    ```json
@@ -225,10 +244,31 @@ This picks one representative frame per distinct chord in the progression
 (the longest span's 25%-mark timestamp) and writes them under
 `cache/<id>/frames/chord-shapes/<chord>.jpg`. Typical output: 10-20 frames.
 
-For each chord, read its frame with the Read tool and answer:
-- Is the player's fretting hand visible and fully placed?
-- What (string, fret) positions are pressed?
-- Does this match the algorithm's chord template for that chord?
+**Use `--zoom` on the extracted frames.** The default full-frame view makes
+individual frets hard to count. `migs-tab frame <ts> --zoom` crops to the
+fretboard only (~3x bigger frets), which is essential for accurate reading.
+
+For each chord, read its zoomed frame with the Read tool and answer in this
+order — **the orientation step is mandatory:**
+
+1. **Orient the fretboard.** Body on image-LEFT, headstock on image-RIGHT for
+   standard front-facing tutorial framing. **LOW frets = right side (near
+   headstock), HIGH frets = left side (near body).** Find the double-dot
+   inlay (fret 12) to anchor counting.
+
+2. **Audio cross-check before committing.** Read `notes.mt3.json` for the
+   pitches MT3 detects during this chord. If your visual reading and the
+   audio pitches disagree about octave (e.g., visual says fret 12 but pitches
+   are in the cowboy range A2–E4), the visual reading is wrong. Re-examine
+   or abstain. Cowboy positions roughly correspond to pitches in the 40–69
+   range; the same shape barred up an octave shifts pitches up by 12.
+
+3. Is the player's fretting hand visible and fully placed? Mid-strum or
+   mid-transition frames give unreliable readings — try another timestamp.
+
+4. What (string, fret) positions are pressed? Use the dot inlays to count.
+
+5. Does this match the algorithm's chord template for that chord?
 
 Output to `cache/<id>/chord-shapes-verified.json`:
 ```json
@@ -237,14 +277,14 @@ Output to `cache/<id>/chord-shapes-verified.json`:
   "verified": {
     "Am": {
       "frame_used": "primary",
-      "voicing": [{"string": 1, "fret": 0}, {"string": 2, "fret": 2}, ...],
+      "voicing": [{"string": 1, "fret": 0, "midi_pitch": 45}, {"string": 2, "fret": 2, "midi_pitch": 52}, ...],
       "voicing_name": "cowboy Am (open)",
       "matches_default_template": true,
       "notes": "Clear open Am voicing — confirmed."
     },
     "E7": {
       "frame_used": "primary",
-      "voicing": [{"string": 0, "fret": 0}, ...],
+      "voicing": [{"string": 0, "fret": 0, "midi_pitch": 40}, ...],
       "voicing_name": "Angie 'money' E7 voicing",
       "matches_default_template": false,
       "notes": "Player uses the non-standard E7 voicing the instructor calls the 'money chord' — different from the default E7 template."
@@ -255,6 +295,14 @@ Output to `cache/<id>/chord-shapes-verified.json`:
   ]
 }
 ```
+
+Each voicing entry needs `string` (0 = low E … 5 = high E) and `fret`
+(relative to the capo). `midi_pitch` — the SOUNDING pitch — is
+optional-but-recommended: include it when you can (it doubles as an
+audio cross-check), but when absent the renderer derives it from the
+detected tuning as `strings_midi[string] + capo + fret`. Malformed
+entries (missing `string`/`fret`) are skipped with a loud warning, not
+silently ignored.
 
 If the primary frame catches the hand mid-transition or at an unusual
 voicing, try a frame from one of the `alternates` (each lists a different
@@ -276,6 +324,12 @@ tempo > longest), filters transient/quiet/duplicate notes, and writes:
 
 - `output/<id>/tab.txt` — ASCII tab with section headers
 - `output/<id>/tab.md` — markdown wrapper with the structural summary
+
+Re-running `render` is always safe: it automatically re-renders when any
+input (`frets.json`, `sections.json`, `tuning.json`, overrides, verified
+chord shapes, `notes.json`, the guitar stem used for beat tracking) is
+newer than the existing outputs, and returns the cached tab otherwise.
+`--force` re-renders unconditionally.
 
 Section order in the rendered tab follows `sections.json` (typically the
 tutorial's teaching order, which is generally a sensible play-through

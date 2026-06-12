@@ -48,11 +48,17 @@ _STEP_FROM_PC: list[tuple[str, int]] = [
 @dataclass
 class _NoteEvent:
     """One note at a quantized position. ``string`` is the MusicXML convention
-    (1 = highest-pitched string), NOT our internal 0-low-E convention."""
+    (1 = highest-pitched string), NOT our internal 0-low-E convention.
+
+    ``marks`` are articulation notations to attach: tuples of
+    (kind, arg) where kind ∈ {hammer, pull, slide, bend, harmonic} and
+    arg is "start"/"stop" for the pairwise kinds, the bend's
+    target_semitones, or None for harmonics."""
 
     midi: int
     mx_string: int
     fret: int
+    marks: tuple = ()
 
 
 def _midi_to_step_octave_alter(midi: int) -> tuple[str, int, int]:
@@ -76,12 +82,18 @@ def render_musicxml(
     beat_times_by_section: dict[str, list[float]],
     subdivisions_per_beat: int = 2,
     beats_per_bar: int = 4,
+    articulations: list[dict] | None = None,
 ) -> bytes:
     """Build a MusicXML score-partwise XML byte string.
 
     Caller is responsible for filtering ``notes_by_section`` to the
-    canonical instance's time window per section.
+    canonical instance's time window per section. ``articulations``
+    (frets.json's optional top-level list; entries reference notes by
+    global note_index) adds slur + hammer-on/pull-off, slide, bend and
+    natural-harmonic notations; None/empty leaves the output
+    byte-identical to before the articulations feature.
     """
+    marks_by_idx = _articulation_marks(articulations, notes_by_section)
     score = Element("score-partwise", version="3.1")
 
     work = SubElement(score, "work")
@@ -118,7 +130,12 @@ def render_musicxml(
             # convention (1 = highest-pitched string).
             mx_string = 6 - int(n["string"])
             note_events_by_slot.setdefault(slot, []).append(
-                _NoteEvent(midi=int(n["pitch"]), mx_string=mx_string, fret=int(n["fret"]))
+                _NoteEvent(
+                    midi=int(n["pitch"]),
+                    mx_string=mx_string,
+                    fret=int(n["fret"]),
+                    marks=tuple(marks_by_idx.get(n.get("note_index"), ())),
+                )
             )
 
         # Emit measures of beats_per_bar * subdivisions_per_beat slots each.
@@ -161,6 +178,93 @@ def render_musicxml(
     return b'<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n' + tostring(
         score, encoding="utf-8"
     )
+
+
+def _articulation_marks(
+    articulations: list[dict] | None,
+    notes_by_section: dict[str, list[dict]],
+) -> dict[int, list[tuple[str, object]]]:
+    """Map global note_index → articulation marks to attach to its <note>.
+
+    Hammer/pull pairs become a <slur> start/stop plus
+    <technical><hammer-on>/<pull-off> start/stop; slides a <slide>
+    start/stop; bends a <technical><bend><bend-alter>; harmonics a
+    <technical><harmonic><natural/>. A pair is marked only when BOTH
+    halves are being emitted from the SAME section — a dangling slur
+    start (other half filtered out, or in a differently-ordered section)
+    is invalid notation.
+
+    Each mark is additionally gated on the EMITTED note records matching
+    the articulation's own (string, fret) evidence — the same
+    on-expected-string / measured-position checks the ASCII renderer
+    applies. A verified-chord-shape override that re-strings a pair half
+    voids the evidence (a cross-string hammer-on is impossible notation)
+    and a bend's struck note moved off the measured position voids the
+    bend; both are silently dropped here, keeping tab.musicxml in
+    agreement with tab.txt from the same run. Malformed entries are
+    skipped, never raised.
+    """
+    if not articulations:
+        return {}
+    # note_index → (section label, emitted note record). Last-write-wins
+    # if the same note_index ever appeared in two sections — safe today
+    # because canonical instance windows never overlap (each note's start
+    # time selects at most one section); if overlapping windows ever
+    # become legal this must become a per-section map, since marks are
+    # attached globally by note_index and a pair valid in one section
+    # would dangle in the other.
+    emitted: dict[int, tuple[str, dict]] = {}
+    for label, notes in notes_by_section.items():
+        for n in notes:
+            idx = n.get("note_index")
+            if idx is not None:
+                emitted[int(idx)] = (label, n)
+    marks: dict[int, list[tuple[str, object]]] = {}
+    for a in articulations:
+        typ = a.get("type")
+        try:
+            if typ in ("hammer", "pull", "slide"):
+                from_idx = int(a["from_note_index"])
+                to_idx = int(a["note_index"])
+                a_string = int(a["string"])
+                src = emitted.get(from_idx)
+                dst = emitted.get(to_idx)
+                if (
+                    src is not None
+                    and dst is not None
+                    and src[0] == dst[0]
+                    and int(src[1]["string"]) == a_string
+                    and int(dst[1]["string"]) == a_string
+                    and int(src[1]["fret"]) == int(a["from_fret"])
+                    and int(dst[1]["fret"]) == int(a["to_fret"])
+                ):
+                    marks.setdefault(from_idx, []).append((typ, "start"))
+                    marks.setdefault(to_idx, []).append((typ, "stop"))
+            elif typ == "bend":
+                idx = int(a["note_index"])
+                rec = emitted.get(idx)
+                if (
+                    rec is not None
+                    and int(rec[1]["string"]) == int(a["string"])
+                    and int(rec[1]["fret"]) == int(a["fret"])
+                ):
+                    marks.setdefault(idx, []).append((typ, int(a.get("target_semitones", 1))))
+            elif typ == "harmonic":
+                idx = int(a["note_index"])
+                rec = emitted.get(idx)
+                # The prelayout pass re-strings a valid harmonic to
+                # (open_string, node_fret); a note NOT at that position
+                # means the entry was rejected there (or never applied)
+                # and must not be marked here either.
+                if (
+                    rec is not None
+                    and int(rec[1]["string"]) == int(a["open_string"])
+                    and int(rec[1]["fret"]) == int(a["node_fret"])
+                ):
+                    marks.setdefault(idx, []).append((typ, None))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return marks
 
 
 def _subdivisions(beat_times: list[float], subs_per_beat: int) -> list[tuple[float, bool]]:
@@ -256,3 +360,26 @@ def _emit_note(measure: Element, ev: _NoteEvent, duration: int, is_chord: bool) 
     technical = SubElement(notations, "technical")
     SubElement(technical, "string").text = str(ev.mx_string)
     SubElement(technical, "fret").text = str(ev.fret)
+    # Articulation notations. Children of <notations> and <technical> are
+    # repeated choice groups in the MusicXML schema, so appending after
+    # string/fret is valid.
+    for kind, arg in ev.marks:
+        if kind in ("hammer", "pull"):
+            SubElement(notations, "slur", number="1", type=str(arg))
+            tech_el = SubElement(
+                technical, "hammer-on" if kind == "hammer" else "pull-off", type=str(arg)
+            )
+            if arg == "start":
+                tech_el.text = "H" if kind == "hammer" else "P"
+        elif kind == "slide":
+            SubElement(
+                notations,
+                "slide",
+                attrib={"line-type": "solid", "number": "1", "type": str(arg)},
+            )
+        elif kind == "bend":
+            bend_el = SubElement(technical, "bend")
+            SubElement(bend_el, "bend-alter").text = str(arg)
+        elif kind == "harmonic":
+            harm_el = SubElement(technical, "harmonic")
+            SubElement(harm_el, "natural")

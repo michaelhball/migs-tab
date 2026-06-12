@@ -12,6 +12,18 @@ slice corresponding to that section's canonical instance. Onset clusters
 are snapped to the nearest 8th-note subdivision so the tab columns align
 to beats — much easier to read than the event-ordered layout we had
 before, and gives an implicit feel for the song's rhythm.
+
+When frets.json carries a top-level ``articulations`` list (see
+_apply_articulations_prelayout / _draw_pair_articulations), the tab also
+shows technique markings: ``0h3`` hammer-ons, ``3p0`` pull-offs, ``3/5``
+and ``5\\3`` slides, ``3b5`` bends (mid-flight transcription artifacts
+hidden), ``<12>`` natural harmonics, plus a legend line naming only the
+symbols actually drawn. Articulation endpoints are protected from the
+velocity-based filters, window-edge endpoints are anchored into their
+section, every in-window articulation either draws its mark or leaves a
+footnote, and drawn bends footnote their measured target pitch. Without
+that list the output is byte-identical to the pre-articulations
+renderer.
 """
 
 from __future__ import annotations
@@ -109,6 +121,32 @@ _LOUD_VELOCITY_KEEP = 75
 # — hence a sentinel above any real 0..127 value.
 _VELOCITY_WHEN_ABSENT = 999
 
+# Articulation-endpoint protection: notes referenced by a detected
+# articulation — h/p/slide endpoints, bend struck notes, harmonic notes,
+# but NOT hidden bend members — are EXEMPT from the _MIN_NOTE_VELOCITY
+# floor and from the cross-instance loudness vote (_LOUD_VELOCITY_KEEP
+# escape). Legato endpoints are quiet BY NATURE: a hammered/pulled
+# destination has no pick attack and an origin often decays under its
+# successor, so velocity heuristics systematically eat exactly these
+# notes — and each detection already passed audio gates (onset-strength
+# ratio, attack percentile, CQT trajectory), evidence strictly stronger
+# than a velocity threshold. Measured before this exemption (wave-5
+# flagships): LBTD's [intro_riff_demo] 0h1p0 lost both D|0 origins
+# (vel 63/42) to the loudness vote and rendered a lone '1'; Angie lost
+# an endpoint on 8 of 61 in-window articulations (e.g. the t=131.9s
+# motif pull's vel-22 origin fell to the quiet-note floor).
+# The set is built by _articulation_note_indices.
+
+# WINDOW-EDGE ANCHOR: a note starting up to this many seconds BEFORE a
+# section's canonical window is still collected IF it is an endpoint of
+# a pair articulation whose other endpoint lies inside the window
+# (_collect_section_notes). LBTD's headline A|0h3 has its from-note at
+# t=0.39s while [song_full_demo] starts at 0.40s — a 0.01s miss rendered
+# a lone '3' in bar 1. Ordinary notes outside the window stay excluded,
+# and a note inside ANOTHER candidate section's window is never anchored
+# (that section owns it — anchoring too would render it twice).
+_ARTIC_EDGE_EPSILON = 0.15
+
 # A verified chord voicing may only relocate notes that are part of a
 # STRUMMED instance of that chord. An onset cluster instantiates a voicing
 # when at least this many DISTINCT voicing pitches sound in it
@@ -139,9 +177,11 @@ _DEMO_QUALITY_RANK = {
     "partial": 1,
 }
 
-# Cap per-section layout footnotes; beyond this they collapse into a
+# Cap per-section COLLISION footnotes; beyond this they collapse into a
 # single "+N more" line so collision-heavy sections don't bury the tab
-# (mirrors annotations._MAX_HINTS_PER_SECTION).
+# (mirrors annotations._MAX_HINTS_PER_SECTION). Articulation footnotes
+# are exempt and ordered first: they carry the no-silent-drop invariant
+# (_draw_pair_articulations) and must never collapse into "+N more".
 _MAX_LAYOUT_NOTES_PER_SECTION = 8
 
 # When a cluster snaps onto an occupied subdivision slot, scan forward at
@@ -150,6 +190,29 @@ _MAX_LAYOUT_NOTES_PER_SECTION = 8
 # rhythm worse than a shared cell does — beyond the budget the clusters
 # share the cell and a footnote is emitted.
 _MAX_SLOT_SHIFT = 3
+
+# Articulation connector characters drawn between an h/p/slide pair's two
+# notes when they land on the same string in adjacent grid slots. Slide
+# convention (documented in the legend): '/' = ascending, '\' = descending
+# — the standard ASCII-tab pairing, chosen over a single '/' for both
+# directions because direction is exactly what a slide mark tells the
+# reader. A pair the layout separated (different bars, collision-bumped
+# slots, override re-stringing) gets a footnote instead of a connector.
+_ARTIC_CONNECTOR = {"hammer": "h", "pull": "p"}
+_SLIDE_UP = "/"
+_SLIDE_DOWN = "\\"
+_PAIR_TYPE_NAMES = {"hammer": "hammer-on", "pull": "pull-off", "slide": "slide"}
+# Legend entries in display order. Only symbols actually drawn in this
+# tab are listed — naming unused symbols would imply detections that
+# never happened.
+_LEGEND_ENTRIES = [
+    ("h", "hammer-on"),
+    ("p", "pull-off"),
+    ("/", "slide up"),
+    ("\\", "slide down"),
+    ("b", "bend"),
+    ("<n>", "natural harmonic"),
+]
 
 # Beat-tracking + quantization parameters.
 _BEAT_SR = 22050
@@ -182,10 +245,16 @@ class RenderedSection:
     tempo_bpm: float
     hints: list[str] = field(default_factory=list)
     # Beat-grid slot collisions: how many clusters snapped onto an already-
-    # occupied subdivision slot, plus footnotes for same-string drops and
-    # cross-string merges the forward scan could not resolve.
+    # occupied subdivision slot. layout_notes holds the articulation
+    # footnotes FIRST (omitted marks + bend targets, never capped — the
+    # no-silent-drop invariant), then footnotes for same-string drops and
+    # cross-string merges the forward scan could not resolve (capped at
+    # _MAX_LAYOUT_NOTES_PER_SECTION).
     slot_collisions: int = 0
     layout_notes: list[str] = field(default_factory=list)
+    # Articulation symbols actually drawn in this section's tab (legend
+    # input): subset of {'h', 'p', '/', '\\', 'b', '<n>'}.
+    artic_symbols: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -261,9 +330,20 @@ def render(
             "Neither sections.json nor structure.json is available; run `migs-tab structure` first."
         )
     frets_data = json.loads(paths.frets_json.read_text())
+    # Articulations are loaded up front: the noise filters and the
+    # cross-instance vote must know which notes are articulation
+    # endpoints (audio-verified legato events, quiet by nature — see the
+    # protection rationale at _ARTIC_EDGE_EPSILON's constant block).
+    articulations = frets_data.get("articulations") or []
+    protected = _articulation_note_indices(articulations)
+    # Raw note starts (pre-filtering) for per-section articulation
+    # windowing — every frets.json note record carries its note_index.
+    note_starts = {
+        n["note_index"]: n["start"] for n in frets_data["notes"] if n.get("note_index") is not None
+    }
     overrides = _load_overrides(paths)
     notes = _apply_overrides(frets_data["notes"], overrides)
-    notes = _filter_noise(notes)
+    notes = _filter_noise(notes, protected=protected)
 
     tuning_info = TuningInfo.from_paths(paths)
 
@@ -272,6 +352,14 @@ def render(
     chord_spans = _load_chord_spans_for_render(paths)
     verified_shapes = _load_verified_chord_shapes(paths)
     notes = _apply_verified_chord_shapes(notes, chord_spans, verified_shapes, tuning_info)
+
+    # Articulation pre-pass (no-op when frets.json carries no
+    # "articulations" — output stays byte-identical): bend-member
+    # transcription artifacts are hidden from layout AND note counts;
+    # natural harmonics are re-strung to their node position. Runs AFTER
+    # the chord-shape pass so a verified-shape remap can never undo a
+    # harmonic's re-stringing.
+    notes = _apply_articulations_prelayout(notes, articulations)
 
     # Secondary-backend notes for ornament hints. If MT3 drove the tab, the
     # secondary is basic-pitch and vice versa. Missing = no hints, fine.
@@ -287,7 +375,12 @@ def render(
     notes_by_section: dict[str, list[dict]] = {}
     beat_times_by_section: dict[str, list[float]] = {}
 
-    rendered: list[RenderedSection] = []
+    # Resolve every candidate section's canonical window up front: the
+    # epsilon-anchor guard in _collect_section_notes needs the OTHER
+    # candidates' windows to refuse anchoring a note that another section
+    # already owns (temporally adjacent windows would otherwise draw and
+    # count the same note twice).
+    candidates: list[tuple[dict, dict]] = []
     for section in sections_data["sections"]:
         if section["label"] in _SKIP_LABELS:
             continue
@@ -296,7 +389,18 @@ def render(
         canonical = _pick_canonical_instance(section)
         if canonical is None:
             continue
-        section_notes = [n for n in notes if canonical["start"] <= n["start"] < canonical["end"]]
+        candidates.append((section, canonical))
+    windows = [(c["start"], c["end"]) for _, c in candidates]
+
+    rendered: list[RenderedSection] = []
+    for i, (section, canonical) in enumerate(candidates):
+        section_notes = _collect_section_notes(
+            notes,
+            articulations,
+            canonical["start"],
+            canonical["end"],
+            other_windows=windows[:i] + windows[i + 1 :],
+        )
         if not section_notes:
             continue
         section_notes = _apply_cross_instance_support(
@@ -305,6 +409,7 @@ def render(
             cross_support.get(section["label"], {}),
             cross_support_min=_CROSS_INSTANCE_MIN_SUPPORT,
             instance_count=len(section.get("instances", [])),
+            protected=protected,
         )
         if not section_notes:
             continue
@@ -313,11 +418,18 @@ def render(
         )
         notes_by_section[section["label"]] = section_notes
         beat_times_by_section[section["label"]] = beat_times
-        ascii_tab, slot_collisions, layout_notes = _render_section_tab(
+        # Each section gets ONLY its own (in-window) articulations, so
+        # the no-silent-drop invariant in _draw_pair_articulations can
+        # footnote a missing endpoint without every other section's
+        # articulations footnoting here too.
+        ascii_tab, slot_collisions, layout_notes, artic_symbols = _render_section_tab(
             section_notes,
             line_width=line_width,
             beat_times=beat_times,
             string_letters=tuning_info.string_letters,
+            articulations=_articulations_in_window(
+                articulations, note_starts, canonical["start"], canonical["end"]
+            ),
         )
         clusters_in_section = {n["cluster_id"] for n in section_notes}
         hints = (
@@ -341,6 +453,7 @@ def render(
                 hints=hints,
                 slot_collisions=slot_collisions,
                 layout_notes=layout_notes,
+                artic_symbols=artic_symbols,
             )
         )
 
@@ -365,6 +478,7 @@ def render(
         beat_times_by_section=beat_times_by_section,
         subdivisions_per_beat=_SUBDIVISIONS_PER_BEAT,
         beats_per_bar=_BEATS_PER_BAR,
+        articulations=articulations,
     )
     (out_dir / "tab.musicxml").write_bytes(xml_bytes)
     return tab_path
@@ -879,11 +993,16 @@ def _apply_cross_instance_support(
     pair_supports: dict[tuple[str, int], int],
     cross_support_min: int,
     instance_count: int,
+    protected: set[int] | frozenset[int] = frozenset(),
 ) -> list[dict]:
     """Drop notes whose exact (chord, pitch) is in fewer than
     ``cross_support_min + 1`` instances. Loud notes (velocity ≥
     ``_LOUD_VELOCITY_KEEP``) survive even without cross-instance backup —
-    the canonical's confidence on its own is decisive."""
+    the canonical's confidence on its own is decisive. So do notes in
+    ``protected`` (articulation endpoints, see the rationale at the
+    _ARTIC_EDGE_EPSILON constant block): legato events are quiet by
+    nature, so the loudness escape systematically fails them even though
+    their detection carries stronger audio evidence than this vote."""
     if instance_count < 2 or not pair_supports:
         return section_notes
     threshold = cross_support_min + 1  # canonical counts as one
@@ -901,6 +1020,8 @@ def _apply_cross_instance_support(
         # so this gate keeps every unsupported note until the salience
         # integration populates energy-proxy velocities. Do not remove it.
         elif n.get("velocity", _VELOCITY_WHEN_ABSENT) >= _LOUD_VELOCITY_KEEP:
+            survivors.append(n)
+        elif n.get("note_index") in protected:
             survivors.append(n)
     return survivors
 
@@ -1011,8 +1132,16 @@ def _subdivisions_from_beats(beat_times: list[float]) -> list[tuple[float, bool]
 # ---------------------------------------------------------------------------
 
 
-def _filter_noise(notes: list[dict]) -> list[dict]:
-    """Drop short-AND-weak, quiet, or duplicate-onset notes."""
+def _filter_noise(
+    notes: list[dict], protected: set[int] | frozenset[int] = frozenset()
+) -> list[dict]:
+    """Drop short-AND-weak, quiet, or duplicate-onset notes.
+
+    ``protected`` holds articulation-referenced note indices (see the
+    rationale at the _ARTIC_EDGE_EPSILON constant block): those notes
+    are exempt from the quiet-note floor ONLY — the short-and-weak gate
+    and duplicate-onset suppression still apply.
+    """
     survivors: list[dict] = []
     for n in notes:
         dur = n.get("end", n["start"]) - n["start"]
@@ -1027,7 +1156,9 @@ def _filter_noise(notes: list[dict]) -> list[dict]:
         # Quiet-note floor, applies regardless of duration. CQT
         # pseudo-velocities landed in frets.json with the wave-1..3 work;
         # notes without one (older artifacts) pass through this gate.
-        if vel is not None and vel < _MIN_NOTE_VELOCITY:
+        # Articulation endpoints are exempt: legato notes are quiet by
+        # nature and carry audio evidence stronger than this heuristic.
+        if vel is not None and vel < _MIN_NOTE_VELOCITY and n.get("note_index") not in protected:
             continue
         survivors.append(n)
 
@@ -1105,6 +1236,262 @@ def _apply_overrides(notes: list[dict], overrides: dict[int, list[dict]]) -> lis
 
 
 # ---------------------------------------------------------------------------
+# Articulations (frets.json optional top-level "articulations" list)
+# ---------------------------------------------------------------------------
+
+
+def _apply_articulations_prelayout(notes: list[dict], articulations: list[dict]) -> list[dict]:
+    """Pre-layout articulation effects on the note list itself.
+
+    - BEND members (``member_note_indices``): mid-flight/target pitches the
+      transcribers caught while the string was bent are transcription
+      artifacts, not separately played notes — removed from layout and
+      from every section's note count.
+    - HARMONICS: the note is re-strung to (open_string, node_fret) per the
+      articulations contract, wherever the Viterbi had put it, and tagged
+      ``natural_harmonic`` so the layout draws ``<node_fret>``.
+
+    Entries reference notes by their global ``note_index`` (the index into
+    frets.json's input notes list that every note record carries).
+    Malformed entries are skipped — articulations must never crash a
+    render. Returns ``notes`` unchanged (the same object) when there is
+    nothing to do, so an articulation-less frets.json renders
+    byte-identically to today.
+    """
+    if not articulations:
+        return notes
+    hidden: set[int] = set()
+    harmonic_by_idx: dict[object, tuple[int, int]] = {}
+    for a in articulations:
+        typ = a.get("type")
+        if typ == "bend":
+            try:
+                struck = int(a["note_index"])
+                members = {int(i) for i in a.get("member_note_indices", [])}
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Never hide the struck note itself, even if a malformed
+            # detection lists it among its own members — that would erase
+            # the whole bend from the tab.
+            members.discard(struck)
+            hidden |= members
+        elif typ == "harmonic":
+            try:
+                idx = int(a["note_index"])
+                open_string = int(a["open_string"])
+                node_fret = int(a["node_fret"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= open_string <= 5 and node_fret >= 0:
+                harmonic_by_idx[idx] = (open_string, node_fret)
+    if not hidden and not harmonic_by_idx:
+        return notes
+    out: list[dict] = []
+    for n in notes:
+        idx = n.get("note_index")
+        if idx in hidden:
+            continue
+        target = harmonic_by_idx.get(idx)
+        if target is not None:
+            n = dict(n)
+            n["string"], n["fret"] = target
+            n["natural_harmonic"] = True
+        out.append(n)
+    return out
+
+
+def _pair_indices(a: dict) -> tuple[int, int] | None:
+    """(from_note_index, note_index) of a pair entry; None when malformed."""
+    try:
+        return int(a["from_note_index"]), int(a["note_index"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _articulation_note_indices(articulations: list[dict]) -> set[int]:
+    """Note indices referenced by any articulation: pair endpoints
+    (from + to), bend STRUCK notes and harmonic notes — NOT bend members,
+    which are transcription artifacts and stay hidden. These notes are
+    exempt from the velocity floor and the cross-instance loudness vote
+    (rationale at the _ARTIC_EDGE_EPSILON constant block). Malformed
+    entries contribute nothing — they never draw a mark either."""
+    protected: set[int] = set()
+    for a in articulations or []:
+        typ = a.get("type")
+        if typ in _PAIR_TYPE_NAMES:
+            pair = _pair_indices(a)
+            if pair is not None:
+                protected.update(pair)
+        elif typ in ("bend", "harmonic"):
+            try:
+                protected.add(int(a["note_index"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return protected
+
+
+def _collect_section_notes(
+    notes: list[dict],
+    articulations: list[dict],
+    start: float,
+    end: float,
+    other_windows: list[tuple[float, float]] | None = None,
+) -> list[dict]:
+    """Notes for one section's canonical window, plus window-edge
+    articulation anchors: a note starting within _ARTIC_EDGE_EPSILON
+    BEFORE ``start`` is included IF it is an endpoint of a pair
+    articulation whose other endpoint is inside the window (the LBTD
+    A|0h3 from-note misses [song_full_demo] by 0.01s otherwise).
+    Ordinary notes outside the window stay excluded; the anchors flow
+    through note/cluster counts like any other section note.
+
+    ``other_windows`` (the OTHER candidate sections' canonical windows)
+    guards against double-rendering: a note inside another section's
+    window is that section's note, never an anchor here — without this,
+    temporally adjacent windows (prev end == next start) would draw and
+    count the same note twice. The owning section still footnotes the
+    straddling pair via the no-silent-drop invariant when the connector
+    cannot be drawn there."""
+    in_window = [n for n in notes if start <= n["start"] < end]
+    if not articulations or not in_window:
+        return in_window
+    inside_idx = {n["note_index"] for n in in_window if n.get("note_index") is not None}
+    partners: dict[int, set[int]] = defaultdict(set)
+    for a in articulations:
+        if a.get("type") not in _PAIR_TYPE_NAMES:
+            continue
+        pair = _pair_indices(a)
+        if pair is None:
+            continue
+        from_idx, to_idx = pair
+        partners[from_idx].add(to_idx)
+        partners[to_idx].add(from_idx)
+    if not partners:
+        return in_window
+    anchors = [
+        n
+        for n in notes
+        if start - _ARTIC_EDGE_EPSILON <= n["start"] < start
+        and partners.get(n.get("note_index"), set()) & inside_idx
+        and not any(s <= n["start"] < e for s, e in other_windows or [])
+    ]
+    return anchors + in_window
+
+
+def _articulations_in_window(
+    articulations: list[dict], note_starts: dict[int, float], start: float, end: float
+) -> list[dict]:
+    """The subset of ``articulations`` belonging to one section's
+    canonical window: any referenced note (pair endpoint, bend struck
+    note, harmonic note) starts inside [start, end). ``note_starts``
+    maps note_index → start over the RAW frets.json notes, so dropping a
+    note in a filter never silently removes its articulation from the
+    section (the no-silent-drop invariant in _draw_pair_articulations
+    footnotes it instead)."""
+    out: list[dict] = []
+    for a in articulations or []:
+        typ = a.get("type")
+        idxs: tuple[int, ...] = ()
+        if typ in _PAIR_TYPE_NAMES:
+            pair = _pair_indices(a)
+            if pair is not None:
+                idxs = pair
+        elif typ in ("bend", "harmonic"):
+            try:
+                idxs = (int(a["note_index"]),)
+            except (KeyError, TypeError, ValueError):
+                idxs = ()
+        if any(start <= note_starts.get(i, float("-inf")) < end for i in idxs):
+            out.append(a)
+    return out
+
+
+def _midi_note_name(midi: int) -> str:
+    """'B3'-style pitch name for a MIDI number (C4 = 60)."""
+    return f"{_PITCH_NAMES_NATURAL[midi % 12]}{midi // 12 - 1}"
+
+
+def _offset_str(t: float, t0: float) -> str:
+    """'+1.2s' offset of ``t`` from the section grid origin, clamped at
+    zero — a window-edge anchor note starts a hair BEFORE the grid and
+    '+-0.0s' would be nonsense."""
+    return f"+{max(0.0, t - t0):.1f}s"
+
+
+def _bend_fields(a: dict) -> tuple[int, int, int, int] | None:
+    """Parse a bend entry's (note_index, fret, string, target_semitones);
+    None when malformed. The token path and the footnote path validate
+    THE SAME field set through this helper, so a malformed entry that
+    never drew a ``b`` token can never emit a misleading "bend mark
+    dropped" footnote either (e.g. an entry missing "string" used to be
+    blamed on overrides that never ran)."""
+    try:
+        return (
+            int(a["note_index"]),
+            int(a["fret"]),
+            int(a["string"]),
+            int(a.get("target_semitones", 1)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _articulation_token(n: dict, bend_by_idx: dict[int, dict]) -> tuple[str, str | None]:
+    """Display token for one laid-out note, plus the legend symbol it uses
+    (None for a plain fret).
+
+    - A re-strung natural harmonic renders angle-bracketed: ``<12>``.
+    - A bend's struck note renders as ``3b5`` (struck fret, 'b', target
+      fret = fret + target_semitones). Cells are padded per-slot to the
+      widest token, so the full form always fits and never breaks the
+      equal-line-length invariant; the contract's ``3b``+footnote narrow
+      fallback is unreachable here. The mark is only drawn while the note
+      still sits at the (string, fret) the detector measured — an
+      override that moved the note voids the bend evidence and the caller
+      footnotes it instead.
+    """
+    if n.get("natural_harmonic"):
+        return f"<{n['fret']}>", "<n>"
+    a = bend_by_idx.get(n.get("note_index"))
+    if a is not None:
+        fields = _bend_fields(a)
+        if fields is None:
+            return str(n["fret"]), None
+        _, fret, string, semitones = fields
+        if fret == int(n["fret"]) and string == int(n["string"]):
+            return f"{fret}b{fret + semitones}", "b"
+    return str(n["fret"]), None
+
+
+def _connector_char(typ: str, from_fret: int, to_fret: int) -> str:
+    """Connector drawn between an articulation pair's adjacent cells."""
+    if typ == "slide":
+        return _SLIDE_UP if to_fret > from_fret else _SLIDE_DOWN
+    return _ARTIC_CONNECTOR[typ]
+
+
+def _articulation_legend(rendered: list[RenderedSection], markdown: bool = False) -> str:
+    """One line naming ONLY the articulation symbols actually drawn in
+    this tab; empty string when there are none.
+
+    ``markdown`` backtick-quotes each symbol: unlike the tab body (fenced
+    code), the legend line is plain Markdown text, where a bare ``<n>``
+    parses as a raw-HTML open tag (GitHub renders it as nothing) and
+    ``\\`` is an escape. Code spans neutralize both."""
+    used: set[str] = set()
+    for sec in rendered:
+        used.update(sec.artic_symbols)
+    if not used:
+        return ""
+    parts = [
+        (f"`{sym}` {name}" if markdown else f"{sym} {name}")
+        for sym, name in _LEGEND_ENTRIES
+        if sym in used
+    ]
+    return "Articulations: " + " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Canonical instance selection
 # ---------------------------------------------------------------------------
 
@@ -1132,7 +1519,8 @@ def _render_section_tab(
     line_width: int,
     beat_times: list[float],
     string_letters: list[str] | None = None,
-) -> tuple[str, int, list[str]]:
+    articulations: list[dict] | None = None,
+) -> tuple[str, int, list[str], list[str]]:
     """Render section's notes as a beat-aligned 6-line ASCII tab.
 
     The visible columns correspond to 8th-note subdivisions of the
@@ -1140,14 +1528,26 @@ def _render_section_tab(
     subdivision. Beat downbeats are marked with a wider separator;
     every ``_BEATS_PER_BAR`` beats a bar line `|` is drawn.
 
-    Returns ``(ascii_tab, slot_collisions, layout_notes)``: how many
-    clusters snapped onto an already-occupied slot (most are resolved by
-    shifting forward to the next free slot), plus footnotes for notes
-    dropped by same-string conflicts and for distinct onsets that still
-    share a cell cross-string after the forward scan.
+    ``articulations`` (frets.json's optional top-level list) adds h/p//
+    connectors between same-string pairs in adjacent slots, ``3b5`` bend
+    tokens and ``<12>`` harmonic tokens; pairs the layout separated are
+    footnoted via the layout_notes machinery instead. The event-ordered
+    fallback (beat detection failed) draws no articulation marks.
+
+    Returns ``(ascii_tab, slot_collisions, layout_notes, artic_symbols)``:
+    how many clusters snapped onto an already-occupied slot (most are
+    resolved by shifting forward to the next free slot), footnotes for
+    notes dropped by same-string conflicts / cross-string cell shares /
+    articulations that could not be drawn inline, and the sorted list of
+    articulation symbols actually drawn (legend input). Articulation
+    footnotes come FIRST in ``layout_notes`` and are exempt from the
+    _MAX_LAYOUT_NOTES_PER_SECTION cap, which truncates only the
+    collision footnotes — the no-silent-drop invariant
+    (_draw_pair_articulations) must hold even in collision-heavy
+    sections.
     """
     if not section_notes:
-        return "", 0, []
+        return "", 0, [], []
 
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for n in section_notes:
@@ -1159,7 +1559,7 @@ def _render_section_tab(
     grid = _subdivisions_from_beats(beat_times)
     if not grid:
         # Beat detection produced nothing usable — fall back to event-ordered.
-        return _render_event_ordered(by_cluster, cluster_ids, line_width, letters), 0, []
+        return _render_event_ordered(by_cluster, cluster_ids, line_width, letters), 0, [], []
 
     # Map each cluster to its nearest grid slot. Two clusters snapping onto
     # the same slot used to merge silently (same-string notes last-write-
@@ -1186,6 +1586,21 @@ def _render_section_tab(
                     slot = candidate
                     break
         cluster_at_slot[slot].extend(by_cluster[cid])
+
+    # Bend lookups for token rendering, and per-note placements so the
+    # articulation pass below can find where each pair half landed. Keys
+    # are int-coerced via _bend_fields so the token path and the footnote
+    # path (which int()-coerces its lookup) can never disagree on whether
+    # an entry exists; malformed entries are dropped from BOTH paths here.
+    bend_by_idx: dict[int, dict] = {}
+    for a in articulations or []:
+        if a.get("type") == "bend":
+            fields = _bend_fields(a)
+            if fields is not None:
+                bend_by_idx[fields[0]] = a
+    # note_index → (slot, line, note, token) for every note actually drawn.
+    placements: dict[int, tuple[int, int, dict, str]] = {}
+    artic_symbols: set[str] = set()
 
     # Build a cell per grid slot (most are empty rests).
     raw_cells: list[list[str]] = []
@@ -1224,7 +1639,12 @@ def _render_section_tab(
                 "as a single chord"
             )
         for line_idx, n in kept_by_line.items():
-            cell[line_idx] = str(n["fret"])
+            token, symbol = _articulation_token(n, bend_by_idx)
+            cell[line_idx] = token
+            if symbol is not None:
+                artic_symbols.add(symbol)
+            if n.get("note_index") is not None:
+                placements[n["note_index"]] = (slot_idx, line_idx, n, token)
         cell_width = max(len(c) for c in cell)
         cell = [c.rjust(cell_width, "-") for c in cell]
         raw_cells.append(cell)
@@ -1234,12 +1654,185 @@ def _render_section_tab(
         else:
             slot_markers.append("")
 
+    artic_notes: list[str] = []
+    sep_overrides = _draw_pair_articulations(
+        articulations,
+        placements,
+        raw_cells,
+        slot_markers,
+        letters,
+        section_t0,
+        artic_notes,
+        artic_symbols,
+    )
+
+    # Cap ONLY the collision footnotes. Articulation footnotes carry the
+    # no-silent-drop invariant (_draw_pair_articulations), so they are
+    # exempt from the cap and ordered first — a collision-heavy section
+    # can never collapse them into the "+N more" line.
     if len(layout_notes) > _MAX_LAYOUT_NOTES_PER_SECTION:
         extra = len(layout_notes) - _MAX_LAYOUT_NOTES_PER_SECTION
         layout_notes = layout_notes[:_MAX_LAYOUT_NOTES_PER_SECTION]
         layout_notes.append(f"… (+{extra} more layout conflicts)")
-    tab = _pack_quantized(raw_cells, slot_markers, line_width, letters)
-    return tab, slot_collisions, layout_notes
+    layout_notes = artic_notes + layout_notes
+    tab = _pack_quantized(raw_cells, slot_markers, line_width, letters, sep_overrides)
+    return tab, slot_collisions, layout_notes, sorted(artic_symbols)
+
+
+def _draw_pair_articulations(
+    articulations: list[dict] | None,
+    placements: dict[int, tuple[int, int, dict, str]],
+    raw_cells: list[list[str]],
+    slot_markers: list[str],
+    letters: list[str],
+    section_t0: float,
+    artic_notes: list[str],
+    artic_symbols: set[str],
+) -> dict[tuple[int, int], str]:
+    """Draw h/p/slide connectors into ``raw_cells`` (mutated in place) and
+    return separator overrides for ``_pack_quantized``.
+
+    A connector is drawn only when BOTH halves of the pair were laid out
+    on the articulation's own string with their detected frets, in
+    adjacent grid slots, not straddling a bar line. The connector char
+    replaces the dash immediately preceding the destination token: the
+    inter-slot separator when the destination cell is flush ('0h3'), or
+    the cell's last padding dash when another string widened the slot
+    ('0-h3') — cell widths never change, preserving the equal-line-length
+    invariant.
+
+    NO-SILENT-DROP INVARIANT: every articulation passed in either draws
+    its mark or leaves an ``artic_notes`` footnote. render() hands each
+    section ONLY its in-window articulations (_articulations_in_window),
+    so a missing placement here means an endpoint is absent from this
+    section's layout: dropped by an earlier stage (short-and-weak gate,
+    dedupe, slot conflict) or — for a pair straddling the window edge —
+    merely outside this window; either way it is footnoted, never
+    silent. The only exception is a malformed entry, which never drew a
+    token, so it never footnotes a "dropped" mark either. To make the
+    invariant cap-proof, ``artic_notes`` is a SEPARATE list from the
+    collision footnotes: the caller exempts it from
+    _MAX_LAYOUT_NOTES_PER_SECTION and prepends it, so a collision-heavy
+    section can never collapse these footnotes into the "+N more" line.
+
+    Drawn bends additionally footnote their measured target pitch
+    ('b4 = bend toward B3') — the token alone names a target FRET, not
+    the pitch the bend reaches for; duplicates are emitted once per
+    section.
+    """
+    sep_overrides: dict[tuple[int, int], str] = {}
+    bend_targets_seen: set[str] = set()
+    for a in articulations or []:
+        typ = a.get("type")
+        if typ in _PAIR_TYPE_NAMES:
+            try:
+                from_idx = int(a["from_note_index"])
+                to_idx = int(a["note_index"])
+                a_string = int(a["string"])
+                from_fret = int(a["from_fret"])
+                to_fret = int(a["to_fret"])
+            except (KeyError, TypeError, ValueError):
+                continue  # malformed entry — never crash a render
+            if not 0 <= a_string <= 5:
+                continue
+            exp_line = 5 - a_string
+            src = placements.get(from_idx)
+            dst = placements.get(to_idx)
+            if src is None or dst is None:
+                # An endpoint is absent from THIS section's layout —
+                # dropped by an earlier stage, or (for a pair straddling
+                # the window edge) merely outside this window and possibly
+                # drawn in its own section. Footnote without blaming a
+                # drop that may not have happened; never silence (see the
+                # invariant in the docstring).
+                placed = src if src is not None else dst
+                when = f" at {_offset_str(placed[2]['start'], section_t0)}" if placed else ""
+                artic_notes.append(
+                    f"{_PAIR_TYPE_NAMES[typ]} {from_fret}->{to_fret} on "
+                    f"{letters[exp_line]} string{when} (endpoint note "
+                    "absent from this section's layout — dropped earlier "
+                    "or outside this window; connector omitted)"
+                )
+                continue
+            s_slot, s_line, s_note, _ = src
+            d_slot, d_line, d_note, d_token = dst
+            on_expected_string = (
+                s_line == exp_line
+                and d_line == exp_line
+                and int(s_note["fret"]) == from_fret
+                and int(d_note["fret"]) == to_fret
+            )
+            adjacent = d_slot == s_slot + 1 and slot_markers[d_slot] != "bar"
+            if on_expected_string and adjacent:
+                char = _connector_char(typ, from_fret, to_fret)
+                cell_str = raw_cells[d_slot][exp_line]
+                pad = len(cell_str) - len(d_token)
+                if pad > 0:
+                    raw_cells[d_slot][exp_line] = cell_str[: pad - 1] + char + cell_str[pad:]
+                else:
+                    sep_overrides[(exp_line, d_slot)] = char
+                artic_symbols.add(char)
+            else:
+                reason = (
+                    "notes separated in layout"
+                    if on_expected_string
+                    else "pair re-strung by overrides"
+                )
+                artic_notes.append(
+                    f"{_PAIR_TYPE_NAMES[typ]} {from_fret}->{to_fret} on "
+                    f"{letters[exp_line]} string at "
+                    f"{_offset_str(s_note['start'], section_t0)} "
+                    f"({reason}; connector omitted)"
+                )
+        elif typ == "bend":
+            # Same field validation as the token path (_bend_fields): a
+            # malformed entry never drew a token, so it must never
+            # footnote a "dropped" mark either.
+            fields = _bend_fields(a)
+            if fields is None:
+                continue
+            idx, fret, _, semitones = fields
+            placed = placements.get(idx)
+            if placed is None:
+                artic_notes.append(
+                    f"bend {fret}->{fret + semitones} (struck note dropped "
+                    "before layout; bend mark omitted)"
+                )
+                continue
+            _, b_line, b_note, b_token = placed
+            if "b" not in b_token:
+                artic_notes.append(
+                    f"bend {fret}->{fret + semitones} at "
+                    f"{_offset_str(b_note['start'], section_t0)} (note re-strung to "
+                    f"{letters[b_line]} string by overrides; bend mark dropped)"
+                )
+            else:
+                # Name the measured target pitch — '3b4' tells the reader
+                # WHERE to fret, this tells them what to listen for.
+                target = (
+                    f"b{fret + semitones} = bend toward "
+                    f"{_midi_note_name(int(b_note['pitch']) + semitones)}"
+                )
+                if target not in bend_targets_seen:
+                    bend_targets_seen.add(target)
+                    artic_notes.append(target)
+        elif typ == "harmonic":
+            # The <n> token is drawn by the cell pass when the note
+            # survived; a dropped note must leave a footnote (invariant).
+            try:
+                idx = int(a["note_index"])
+                open_string = int(a["open_string"])
+                node_fret = int(a["node_fret"])
+            except (KeyError, TypeError, ValueError):
+                continue  # malformed — prelayout drew nothing either
+            if not (0 <= open_string <= 5 and node_fret >= 0):
+                continue  # same validation as _apply_articulations_prelayout
+            if placements.get(idx) is None:
+                artic_notes.append(
+                    f"natural harmonic <{node_fret}> on {letters[5 - open_string]} "
+                    "string (note dropped before layout; mark omitted)"
+                )
+    return sep_overrides
 
 
 def _slot_winner(a: dict, b: dict) -> tuple[dict, dict]:
@@ -1310,6 +1903,7 @@ def _pack_quantized(
     markers: list[str],
     line_width: int,
     string_letters: list[str],
+    sep_overrides: dict[tuple[int, int], str] | None = None,
 ) -> str:
     """Pack beat-quantized cells into systems, wrapping at bar boundaries.
 
@@ -1318,6 +1912,13 @@ def _pack_quantized(
     line is already at or beyond the line-width budget, wrap there — the
     completed bars become a system and the new bar's first cell starts
     the next system. A closing `|` is appended to the very last system.
+
+    ``sep_overrides`` maps (line_idx, slot_idx) → a 1-char articulation
+    connector drawn instead of the `-` separator preceding that slot on
+    that one line ('0h3'). Bar-line `|` prefixes are never overridden, so
+    bar alignment and line lengths are untouched. Wrapping only happens
+    at bar boundaries and connectors never sit on one, so a connector can
+    never be split across systems.
     """
     if not cells:
         return ""
@@ -1332,7 +1933,10 @@ def _pack_quantized(
         else:
             prefix = "-"
         for i in range(6):
-            current[i] += prefix + cell[i]
+            line_prefix = prefix
+            if prefix == "-" and sep_overrides:
+                line_prefix = sep_overrides.get((i, idx), prefix)
+            current[i] += line_prefix + cell[i]
         # Wrap only when we just placed a `|` AND we're past the budget.
         if marker == "bar" and idx > 0 and len(current[0]) > line_width - 4:
             bar_end = len(current[0]) - len(cell[0])
@@ -1402,6 +2006,9 @@ def _format_full_tab(
     lines.append(
         f"Strings (low → high): {tuning.strings_midi}  · detection source: {tuning.source}"
     )
+    legend = _articulation_legend(rendered)
+    if legend:
+        lines.append(legend)
     lines.append("")
     summary = sections_data.get("structural_summary")
     if summary:
@@ -1432,7 +2039,7 @@ def _format_full_tab(
         lines.append(sec.ascii_tab)
         if sec.layout_notes:
             lines.append("")
-            lines.append("layout notes (beat-grid collisions):")
+            lines.append("layout & articulation notes:")
             for note in sec.layout_notes:
                 lines.append(f"  • {note}")
         if sec.hints:
@@ -1458,6 +2065,9 @@ def _format_markdown(
     parts.append(
         f"  \nStrings low → high: `{tuning.strings_midi}` · detection source: `{tuning.source}`\n"
     )
+    legend = _articulation_legend(rendered, markdown=True)
+    if legend:
+        parts.append(f"_{legend}_\n")
     summary = sections_data.get("structural_summary")
     if summary:
         parts.append(f"_{summary}_\n")
@@ -1477,7 +2087,7 @@ def _format_markdown(
         parts.append(sec.ascii_tab)
         parts.append("```")
         if sec.layout_notes:
-            parts.append("\n**layout notes** _(beat-grid collisions)_:\n")
+            parts.append("\n**layout & articulation notes:**\n")
             for note in sec.layout_notes:
                 parts.append(f"- {note}")
             parts.append("")

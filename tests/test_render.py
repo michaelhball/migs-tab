@@ -9,11 +9,19 @@ import os
 from migs_tab.paths import VideoPaths
 from migs_tab.render import (
     _DEFAULT_TAB_STRING_LETTERS,
+    RenderedSection,
     TuningInfo,
+    _apply_articulations_prelayout,
+    _apply_cross_instance_support,
     _apply_overrides,
     _apply_verified_chord_shapes,
+    _articulation_legend,
+    _articulation_note_indices,
+    _articulations_in_window,
     _build_cross_instance_support,
+    _collect_section_notes,
     _filter_noise,
+    _format_full_tab,
     _format_time,
     _load_overrides,
     _nearest_index,
@@ -664,7 +672,7 @@ class TestSlotWinner:
             _note(0.95, 2.0, 64, 5, 0, 0, overridden_by="verified-shape:Am"),
             _note(1.02, 1.3, 69, 5, 5, 1),
         ]
-        tab, collisions, layout_notes = _render_section_tab(
+        tab, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0]
         )
         assert collisions == 1
@@ -687,7 +695,7 @@ class TestSlotCollisions:
             _note(0.0, 0.4, 45, 1, 0, 0),
             _note(0.1, 0.5, 47, 1, 2, 1),  # also snaps to slot 0 → bumped to slot 1
         ]
-        tab, collisions, layout_notes = _render_section_tab(
+        tab, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0]
         )
         assert collisions == 1
@@ -705,7 +713,7 @@ class TestSlotCollisions:
             _note(0.05, 0.5, 47, 1, 2, 1),
             _note(0.1, 0.5, 48, 1, 3, 2),
         ]
-        tab, collisions, layout_notes = _render_section_tab(
+        tab, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0]
         )
         assert collisions == 2
@@ -721,7 +729,7 @@ class TestSlotCollisions:
             _note(0.95, 2.0, 64, 5, 0, 0),
             _note(1.02, 1.3, 67, 5, 3, 1),  # same string, same slot, no escape
         ]
-        tab, collisions, layout_notes = _render_section_tab(
+        tab, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0]
         )
         assert collisions == 1
@@ -740,7 +748,7 @@ class TestSlotCollisions:
             _note(0.95, 2.0, 64, 5, 0, 0),
             _note(1.02, 1.3, 59, 4, 0, 1),  # different string → cell shared
         ]
-        _, collisions, layout_notes = _render_section_tab(
+        _, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0]
         )
         assert collisions == 1
@@ -759,7 +767,7 @@ class TestSlotCollisions:
             _note(0.15, 0.4, 50, 1, 5, 3),
             _note(0.2, 0.4, 52, 2, 2, 4),  # other string; shares slot 0 with cluster 0
         ]
-        _, collisions, layout_notes = _render_section_tab(
+        _, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0, 4.0]
         )
         assert collisions == 4
@@ -771,7 +779,7 @@ class TestSlotCollisions:
             _note(0.0, 0.4, 45, 1, 0, 0),
             _note(1.0, 1.4, 47, 1, 2, 1),
         ]
-        _, collisions, layout_notes = _render_section_tab(
+        _, collisions, layout_notes, _ = _render_section_tab(
             notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0]
         )
         assert collisions == 0
@@ -781,7 +789,7 @@ class TestSlotCollisions:
         # 11 same-string notes in one cluster → 10 conflicts; footnotes are
         # capped at 8 plus a "+N more" summary so the tab isn't buried.
         notes = [_note(0.0, 0.5, 64 + f, 5, f, 0) for f in range(11)]
-        _, _, layout_notes = _render_section_tab(notes, line_width=72, beat_times=[0.0, 1.0])
+        _, _, layout_notes, _ = _render_section_tab(notes, line_width=72, beat_times=[0.0, 1.0])
         assert len(layout_notes) == 9
         assert layout_notes[-1] == "… (+2 more layout conflicts)"
 
@@ -876,3 +884,1035 @@ class TestStaleness:
         md_path = tab_path.with_name("tab.md")
         md_path.unlink()
         assert _outputs_fresh(paths, tab_path, md_path) is False
+
+
+def _line(tab: str, letter: str) -> str:
+    """First tab line whose label matches ``letter`` (e.g. 'A|...')."""
+    return next(line for line in tab.splitlines() if line.lstrip().startswith(f"{letter}|"))
+
+
+class TestArticulationPrelayout:
+    """Bend-member hiding and harmonic re-stringing happen BEFORE layout,
+    so members vanish from note counts and harmonics land on their node
+    position regardless of where the Viterbi put them."""
+
+    def test_no_articulations_returns_same_object(self):
+        # Byte-stability anchor: an articulation-less frets.json must flow
+        # through untouched (not even a copy).
+        notes = [_note(0.0, 0.5, 45, 1, 0, 0)]
+        assert _apply_articulations_prelayout(notes, []) is notes
+
+    def test_bend_members_hidden(self):
+        notes = [
+            _note(0.0, 0.6, 58, 3, 3, 0, note_index=10),  # struck A#3, G|3
+            _note(0.2, 0.4, 60, 3, 5, 0, note_index=11),  # mid-flight C4 artifact
+        ]
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [11],
+            "evidence": {},
+        }
+        result = _apply_articulations_prelayout(notes, [bend])
+        assert [n["note_index"] for n in result] == [10]
+
+    def test_struck_note_never_hidden_even_if_self_listed(self):
+        # Defensive: a malformed detection listing the struck note among
+        # its own members must not erase the whole bend.
+        notes = [_note(0.0, 0.6, 58, 3, 3, 0, note_index=10)]
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [10],
+            "evidence": {},
+        }
+        result = _apply_articulations_prelayout(notes, [bend])
+        assert len(result) == 1
+
+    def test_harmonic_restrung_to_node_position(self):
+        # Angie's 12th-fret A-string harmonic: transcribed as A3 (57) and
+        # fretted by the Viterbi at G|2 — must move to A|12 and be tagged.
+        notes = [_note(1.0, 2.6, 57, 3, 2, 0, note_index=5)]
+        harm = {"type": "harmonic", "note_index": 5, "open_string": 1, "node_fret": 12}
+        result = _apply_articulations_prelayout(notes, [harm])
+        assert result[0]["string"] == 1
+        assert result[0]["fret"] == 12
+        assert result[0]["natural_harmonic"] is True
+        # Original list untouched (copy-on-write).
+        assert notes[0]["string"] == 3
+
+    def test_invalid_open_string_skipped(self):
+        notes = [_note(1.0, 2.6, 57, 3, 2, 0, note_index=5)]
+        harm = {"type": "harmonic", "note_index": 5, "open_string": 9, "node_fret": 12}
+        result = _apply_articulations_prelayout(notes, [harm])
+        assert result[0]["string"] == 3  # unchanged
+
+    def test_malformed_entries_never_crash(self):
+        notes = [_note(0.0, 0.5, 45, 1, 0, 0, note_index=0)]
+        artics = [
+            {"type": "bend"},  # missing everything
+            {"type": "harmonic", "note_index": "x", "open_string": 1, "node_fret": 12},
+            {"type": "wat"},
+        ]
+        assert _apply_articulations_prelayout(notes, artics) is notes
+
+
+def _pair(typ, from_idx, to_idx, string, from_fret, to_fret):
+    return {
+        "type": typ,
+        "from_note_index": from_idx,
+        "note_index": to_idx,
+        "string": string,
+        "from_fret": from_fret,
+        "to_fret": to_fret,
+        "evidence": {"onset_ratio": 0.4},
+    }
+
+
+class TestArticulationConnectors:
+    # Beat grid [0,1,2,3]: 8th-note slots every 0.5s, indices 0..6; only
+    # slot 0 carries a bar marker (bars are 4 beats).
+
+    def test_hammer_connector_adjacent_slots(self):
+        # LBTD intro-riff ground truth shape: A|0 then A|3 → 'A|0h3'.
+        notes = [
+            _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+            _note(0.5, 0.9, 48, 1, 3, 1, note_index=1),
+        ]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "0h3" in _line(tab, "A")
+        assert symbols == ["h"]
+        assert layout_notes == []
+
+    def test_pull_connector(self):
+        # Angie intro motif: e|3 then e|0 → 'e|3p0'.
+        notes = [
+            _note(0.0, 0.4, 67, 5, 3, 0, note_index=0),
+            _note(0.5, 0.9, 64, 5, 0, 1, note_index=1),
+        ]
+        tab, _, _, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("pull", 0, 1, 5, 3, 0)],
+        )
+        assert "3p0" in _line(tab, "e")
+        assert symbols == ["p"]
+
+    def test_slide_up_connector(self):
+        notes = [
+            _note(0.0, 0.4, 53, 2, 3, 0, note_index=0),
+            _note(0.5, 0.9, 55, 2, 5, 1, note_index=1),
+        ]
+        tab, _, _, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("slide", 0, 1, 2, 3, 5)],
+        )
+        assert "3/5" in _line(tab, "D")
+        assert symbols == ["/"]
+
+    def test_slide_down_connector(self):
+        # Documented convention: descending slides use '\'.
+        notes = [
+            _note(0.0, 0.4, 55, 2, 5, 0, note_index=0),
+            _note(0.5, 0.9, 53, 2, 3, 1, note_index=1),
+        ]
+        tab, _, _, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("slide", 0, 1, 2, 5, 3)],
+        )
+        assert "5\\3" in _line(tab, "D")
+        assert symbols == ["\\"]
+
+    def test_chained_hammer_pull_shares_middle_note(self):
+        # LBTD final-chorus figure D|0h1p0: hammer 0->1 then pull 1->0,
+        # the middle note serving as the hammer's destination AND the
+        # pull's source. The pull's destination also sits on a beat-
+        # marked slot (t=1.0 is beat 2), whose separator is still '-'.
+        notes = [
+            _note(0.0, 0.4, 50, 2, 0, 0, note_index=0),
+            _note(0.5, 0.9, 51, 2, 1, 1, note_index=1),
+            _note(1.0, 1.4, 50, 2, 0, 2, note_index=2),
+        ]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 2, 0, 1), _pair("pull", 1, 2, 2, 1, 0)],
+        )
+        assert "0h1p0" in _line(tab, "D")
+        assert symbols == ["h", "p"]
+        assert layout_notes == []
+
+    def test_connector_into_beat_marked_destination_slot(self):
+        # Destination lands exactly ON a beat (slot 2, t=1.0). Beat slots
+        # keep the plain '-' separator (only bar slots use '|'), so the
+        # connector override applies there like anywhere else.
+        notes = [
+            _note(0.5, 0.9, 45, 1, 0, 0, note_index=0),  # off-beat slot 1
+            _note(1.0, 1.4, 48, 1, 3, 1, note_index=1),  # beat slot 2
+        ]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "0h3" in _line(tab, "A")
+        assert symbols == ["h"]
+        assert layout_notes == []
+
+    def test_two_digit_fret_pair_keeps_equal_line_lengths(self):
+        # '12/14' — both tokens two digits wide; every string line in the
+        # system must stay the same length.
+        notes = [
+            _note(0.0, 0.4, 57, 1, 12, 0, note_index=0),
+            _note(0.5, 0.9, 59, 1, 14, 1, note_index=1),
+        ]
+        tab, _, _, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("slide", 0, 1, 1, 12, 14)],
+        )
+        assert "12/14" in _line(tab, "A")
+        assert symbols == ["/"]
+        for system in tab.split("\n\n"):
+            lengths = {len(line) for line in system.splitlines()}
+            assert len(lengths) == 1, f"unequal line lengths in system:\n{system}"
+
+    def test_connector_in_widened_slot_padding(self):
+        # The destination slot is widened to 2 chars by a 2-digit fret on
+        # another string, so the connector lands in the cell padding
+        # ('0-h3'), not on the separator — slot widths must not change.
+        notes = [
+            _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+            _note(0.5, 0.9, 48, 1, 3, 1, note_index=1),
+            _note(0.5, 0.9, 65, 5, 1, 1, note_index=2),  # placeholder same cluster
+        ]
+        notes[2]["fret"] = 10  # e|10 widens the slot
+        notes[2]["pitch"] = 74
+        tab, _, _, _ = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "0-h3" in _line(tab, "A")
+        assert "10" in _line(tab, "e")
+
+    def test_orphaned_pair_footnoted_not_silent(self):
+        # FROM half was dropped by an earlier stage (not in section notes
+        # at all): render() only passes in-window articulations, so this
+        # IS a real dropped endpoint — footnote, never silence.
+        notes = [_note(0.5, 0.9, 48, 1, 3, 1, note_index=1)]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "h" not in _line(tab, "A")
+        assert symbols == []
+        assert len(layout_notes) == 1
+        assert "hammer-on 0->3 on A string at +0.5s" in layout_notes[0]
+        assert "endpoint note absent from this section's layout" in layout_notes[0]
+        assert "connector omitted" in layout_notes[0]
+
+    def test_pair_separated_by_collision_bump_footnotes(self):
+        # An interloper cluster occupies the destination slot, so the TO
+        # note is bumped one further — pair lands 2 slots apart → footnote,
+        # no connector.
+        notes = [
+            _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+            _note(0.45, 0.8, 50, 2, 0, 1, note_index=1),  # interloper, D string
+            _note(0.55, 0.9, 48, 1, 3, 2, note_index=2),  # bumped to slot 2
+        ]
+        tab, collisions, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 2, 1, 0, 3)],
+        )
+        assert collisions == 1
+        assert "0h3" not in _line(tab, "A")
+        assert symbols == []
+        assert len(layout_notes) == 1
+        assert layout_notes[0].startswith("hammer-on 0->3 on A string at +0.0s")
+        assert "connector omitted" in layout_notes[0]
+
+    def test_pair_across_bar_line_footnotes(self):
+        # Beats [0..5] → bar line before slot 8 (beat 5 at 4.0s). The pair
+        # lands in adjacent slots 7 and 8 but in DIFFERENT bars → footnote.
+        notes = [
+            _note(3.5, 3.9, 45, 1, 0, 0, note_index=0),
+            _note(4.0, 4.4, 48, 1, 3, 1, note_index=1),
+        ]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "0h3" not in _line(tab, "A")
+        assert "0|3" in _line(tab, "A")  # bar line preserved
+        assert symbols == []
+        assert len(layout_notes) == 1
+        assert "hammer-on 0->3 on A string" in layout_notes[0]
+
+    def test_restrung_half_drops_connector_keeps_footnote(self):
+        # A chord-shape override moved the TO note to another string; the
+        # articulation's string field no longer matches → footnote only.
+        notes = [
+            _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+            _note(0.5, 0.9, 48, 2, 3, 1, note_index=1),  # re-strung to D
+        ]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("hammer", 0, 1, 1, 0, 3)],
+        )
+        assert "h" not in _line(tab, "A")
+        assert symbols == []
+        assert len(layout_notes) == 1
+        assert "pair re-strung by overrides" in layout_notes[0]
+
+    def test_pair_referencing_hidden_bend_member_footnotes(self):
+        # A hammer whose destination is a bend member: the member is hidden
+        # pre-layout, so the pair half is missing → footnoted (invariant:
+        # mark or footnote, never silence), while the bend itself renders
+        # with its target-pitch footnote.
+        notes = [
+            _note(0.0, 0.6, 58, 3, 3, 0, note_index=10),
+            _note(0.2, 0.4, 60, 3, 5, 0, note_index=11),  # member
+        ]
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [11],
+            "evidence": {},
+        }
+        artics = [bend, _pair("hammer", 10, 11, 3, 3, 5)]
+        kept = _apply_articulations_prelayout(notes, artics)
+        tab, _, layout_notes, symbols = _render_section_tab(
+            kept,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=artics,
+        )
+        assert "3b5" in _line(tab, "G")
+        assert symbols == ["b"]
+        assert len(layout_notes) == 2
+        assert layout_notes[0] == "b5 = bend toward C4"  # A#3(58) + 2 = C4
+        assert "hammer-on 3->5 on G string" in layout_notes[1]
+        assert "connector omitted" in layout_notes[1]
+
+    def test_bend_on_restrung_note_footnoted_not_drawn(self):
+        # The struck note no longer sits at the measured (string, fret) —
+        # an override moved it — so the 'b' mark is dropped + footnoted.
+        notes = [_note(0.0, 0.6, 58, 4, 6, 0, note_index=10)]  # moved to B|6
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [],
+            "evidence": {},
+        }
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[bend],
+        )
+        assert "b" not in _line(tab, "B")
+        assert symbols == []
+        assert len(layout_notes) == 1
+        assert "bend 3->5" in layout_notes[0]
+        assert "bend mark dropped" in layout_notes[0]
+
+    def test_malformed_bend_missing_string_no_token_no_footnote(self):
+        # Entry missing "string" on a note that IS at the measured G|3:
+        # the token path never drew 'b', so the footnote path must not
+        # blame "overrides" that never ran — same field set both paths.
+        notes = [_note(0.0, 0.6, 58, 3, 3, 0, note_index=10)]
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [],
+            "evidence": {},
+        }
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[bend],
+        )
+        assert "b" not in _line(tab, "G")
+        assert symbols == []
+        assert layout_notes == []
+
+    def test_string_typed_note_index_token_and_footnote_agree(self):
+        # A JSON-stringly note_index ("10") is int-coerced once when
+        # bend_by_idx is built, so the token path and the footnote path
+        # can never disagree on whether the entry exists: token drawn,
+        # no footnote.
+        notes = [_note(0.0, 0.6, 58, 3, 3, 0, note_index=10)]
+        bend = {
+            "type": "bend",
+            "note_index": "10",
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [],
+            "evidence": {},
+        }
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[bend],
+        )
+        assert "3b5" in _line(tab, "G")
+        assert symbols == ["b"]
+        assert layout_notes == ["b5 = bend toward C4"]
+
+    def test_no_articulations_identical_output(self):
+        notes = [
+            _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+            _note(0.5, 0.9, 48, 1, 3, 1, note_index=1),
+        ]
+        base = _render_section_tab(notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0])
+        with_none = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=None
+        )
+        with_empty = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=[]
+        )
+        assert base == with_none == with_empty
+        assert base[3] == []
+
+
+def _five_type_fixture():
+    """One section exercising all five articulation types at once."""
+    notes = [
+        _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),  # A|0 ┐ hammer
+        _note(0.5, 0.9, 48, 1, 3, 1, note_index=1),  # A|3 ┘
+        _note(1.0, 1.4, 67, 5, 3, 2, note_index=2),  # e|3 ┐ pull
+        _note(1.5, 1.9, 64, 5, 0, 3, note_index=3),  # e|0 ┘
+        _note(2.0, 2.4, 53, 2, 3, 4, note_index=4),  # D|3 ┐ slide up
+        _note(2.5, 2.9, 55, 2, 5, 5, note_index=5),  # D|5 ┘
+        _note(3.0, 3.6, 58, 3, 3, 6, note_index=6),  # G|3 bend struck (A#3)
+        _note(3.1, 3.3, 60, 3, 5, 6, note_index=7),  # mid-flight C4 artifact
+        _note(4.0, 5.6, 57, 3, 2, 7, note_index=8),  # A3 at G|2 → harmonic A|<12>
+    ]
+    artics = [
+        _pair("hammer", 0, 1, 1, 0, 3),
+        _pair("pull", 2, 3, 5, 3, 0),
+        _pair("slide", 4, 5, 2, 3, 5),
+        {
+            "type": "bend",
+            "note_index": 6,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [7],
+            "evidence": {"cqt_trajectory": "A#3->C4"},
+        },
+        {
+            "type": "harmonic",
+            "note_index": 8,
+            "open_string": 1,
+            "node_fret": 12,
+            "evidence": {"octave_pair": True},
+        },
+    ]
+    return notes, artics
+
+
+class TestAllFiveTypes:
+    def _render(self):
+        notes, artics = _five_type_fixture()
+        kept = _apply_articulations_prelayout(notes, artics)
+        return _render_section_tab(
+            kept,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            articulations=artics,
+        )
+
+    def test_all_tokens_present(self):
+        tab, _, layout_notes, symbols = self._render()
+        assert "0h3" in _line(tab, "A")
+        assert "3p0" in _line(tab, "e")
+        assert "3/5" in _line(tab, "D")
+        assert "3b5" in _line(tab, "G")
+        assert "<12>" in _line(tab, "A")
+        assert symbols == ["/", "<n>", "b", "h", "p"]
+        # The only footnote is the drawn bend's target pitch.
+        assert layout_notes == ["b5 = bend toward C4"]
+
+    def test_equal_line_lengths_in_every_system(self):
+        # THE ASCII-tab invariant: mixed-width tokens (<12>, 3b5) must
+        # never skew one string line against the others.
+        tab, _, _, _ = self._render()
+        for system in tab.split("\n\n"):
+            lengths = {len(line) for line in system.splitlines()}
+            assert len(lengths) == 1, f"unequal line lengths in system:\n{system}"
+
+    def test_member_note_excluded_from_layout(self):
+        notes, artics = _five_type_fixture()
+        kept = _apply_articulations_prelayout(notes, artics)
+        assert len(kept) == len(notes) - 1
+        tab, _, _, _ = self._render()
+        # The artifact's fret-5 G-string token must not appear anywhere:
+        # the only G-line tokens are the bend's '3b5'.
+        g_line = _line(tab, "G")
+        assert g_line.count("5") == 1  # the '5' inside '3b5'
+
+
+class TestArticulationLegend:
+    def _sec(self, symbols):
+        return RenderedSection(
+            label="x",
+            description="",
+            canonical_start=0.0,
+            canonical_end=1.0,
+            chord_progression=[],
+            cluster_count=0,
+            note_count=0,
+            ascii_tab="",
+            tempo_bpm=90.0,
+            artic_symbols=symbols,
+        )
+
+    def test_empty_when_no_symbols(self):
+        assert _articulation_legend([self._sec([])]) == ""
+
+    def test_lists_only_used_symbols_in_fixed_order(self):
+        legend = _articulation_legend([self._sec(["h", "b"]), self._sec(["<n>"])])
+        assert legend == "Articulations: h hammer-on · b bend · <n> natural harmonic"
+
+    def test_slide_directions_named_separately(self):
+        legend = _articulation_legend([self._sec(["/", "\\"])])
+        assert legend == "Articulations: / slide up · \\ slide down"
+
+    def test_markdown_variant_backticks_symbols(self):
+        # The tab.md legend sits OUTSIDE the code fences, where a bare
+        # '<n>' is a raw-HTML open tag (GitHub swallows it) and '\' is an
+        # escape — code spans keep both visible.
+        legend = _articulation_legend([self._sec(["h", "\\", "<n>"])], markdown=True)
+        assert legend == ("Articulations: `h` hammer-on · `\\` slide down · `<n>` natural harmonic")
+
+    def test_full_tab_carries_legend_line(self):
+        sections_data = {"video_id": "test", "sections": []}
+        tuning = _standard_tuning()
+        text = _format_full_tab(sections_data, [self._sec(["h", "p"])], tuning)
+        assert "Articulations: h hammer-on · p pull-off" in text
+        # And absent when nothing was drawn (byte-stability).
+        text_plain = _format_full_tab(sections_data, [self._sec([])], tuning)
+        assert "Articulations:" not in text_plain
+
+
+class TestRenderWithArticulations:
+    """End-to-end through render(): legend, member-aware note counts, and
+    byte-stability when frets.json has no articulations."""
+
+    def _seed(self, tmp_path, articulations=None):
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path / "cache")
+        # No guitar stem → _detect_beats falls back to a uniform 90 bpm
+        # grid (slots every 1/3 s).
+        frets = {
+            "notes": [
+                _note(0.0, 0.4, 45, 1, 0, 0, note_index=0),
+                _note(0.34, 0.7, 48, 1, 3, 1, note_index=1),
+                _note(1.0, 1.5, 58, 3, 3, 2, note_index=2),
+                _note(1.05, 1.2, 60, 3, 5, 2, note_index=3),  # bend member
+                _note(2.0, 3.5, 57, 3, 2, 3, note_index=4),  # harmonic source
+            ]
+        }
+        if articulations is not None:
+            frets["articulations"] = articulations
+        paths.frets_json.write_text(json.dumps(frets))
+        paths.sections_json.write_text(
+            json.dumps(
+                {
+                    "video_id": "aaa11111111",
+                    "structural_summary": "one tiny section",
+                    "sections": [
+                        {
+                            "label": "riff",
+                            "description": "",
+                            "chord_progression": ["A"],
+                            "instances": [
+                                {"start": 0.0, "end": 4.0, "demo_quality": "normal-tempo"}
+                            ],
+                        }
+                    ],
+                }
+            )
+        )
+        return paths
+
+    def _artics(self):
+        return [
+            _pair("hammer", 0, 1, 1, 0, 3),
+            {
+                "type": "bend",
+                "note_index": 2,
+                "string": 3,
+                "fret": 3,
+                "target_semitones": 2,
+                "member_note_indices": [3],
+                "evidence": {},
+            },
+            {
+                "type": "harmonic",
+                "note_index": 4,
+                "open_string": 1,
+                "node_fret": 12,
+                "evidence": {},
+            },
+        ]
+
+    def test_tab_has_tokens_legend_and_member_aware_count(self, tmp_path):
+        paths = self._seed(tmp_path, articulations=self._artics())
+        tab_path = render(paths, output_root=tmp_path / "out")
+        text = tab_path.read_text()
+        assert "0h3" in text
+        assert "3b5" in text
+        assert "<12>" in text
+        assert "Articulations: h hammer-on · b bend · <n> natural harmonic" in text
+        # 5 notes in frets.json, 1 hidden bend member → 4 in the count.
+        assert "(4 notes" in text
+        # Markdown mirrors the legend, with symbols backtick-quoted so
+        # '<n>' survives CommonMark's raw-HTML parsing outside the fences.
+        md = tab_path.with_name("tab.md").read_text()
+        assert "Articulations: `h` hammer-on · `b` bend · `<n>` natural harmonic" in md
+        assert "Articulations: h hammer-on" not in md
+
+    def test_absent_articulations_is_byte_stable(self, tmp_path):
+        # No "articulations" key vs explicit empty list → identical bytes.
+        p1 = self._seed(tmp_path / "a")
+        t1 = render(p1, output_root=tmp_path / "a" / "out").read_text()
+        p2 = self._seed(tmp_path / "b", articulations=[])
+        t2 = render(p2, output_root=tmp_path / "b" / "out").read_text()
+        assert t1 == t2
+        assert "Articulations:" not in t1
+
+
+class TestArticulationEndpointProtection:
+    """GAP 2: articulation endpoints are audio-verified legato events and
+    quiet BY NATURE — the velocity floor and the cross-instance loudness
+    vote must not eat them (the detection's audio evidence outranks a
+    velocity heuristic)."""
+
+    def test_quiet_endpoint_survives_velocity_floor(self):
+        # Angie motif pull A|3->0 at t≈131.9s: the vel-22 from-note fell
+        # to _MIN_NOTE_VELOCITY=35 and the pull lost its origin.
+        notes = [
+            {"note_index": 7, "start": 131.87, "end": 132.1, "pitch": 48, "velocity": 22},
+            {"note_index": 8, "start": 132.2, "end": 132.5, "pitch": 45, "velocity": 80},
+        ]
+        assert len(_filter_noise(notes)) == 1
+        assert len(_filter_noise(notes, protected={7, 8})) == 2
+
+    def test_protection_does_not_revive_short_and_weak(self):
+        # Only the quiet floor is exempted — a short AND weak note still
+        # drops (its existence, not just its strength, is in doubt).
+        notes = [{"note_index": 7, "start": 0.0, "end": 0.05, "pitch": 60, "velocity": 22}]
+        assert _filter_noise(notes, protected={7}) == []
+
+    def test_cross_instance_vote_spares_protected_endpoints(self):
+        # LBTD [intro_riff_demo] 0h1p0: the D|0 origins (vel 63/42) miss
+        # the >=75 loudness escape and the figure rendered a lone '1'.
+        section_notes = [
+            {"note_index": 126, "start": 70.38, "pitch": 50, "velocity": 63},
+            {"note_index": 127, "start": 70.68, "pitch": 51, "velocity": 76},
+            {"note_index": 128, "start": 70.83, "pitch": 50, "velocity": 42},
+        ]
+        spans = [(61.6, 73.0, "A")]
+        supports = {("A", 51): 2}  # only the middle note confirmed by the other take
+        kept = _apply_cross_instance_support(
+            section_notes, spans, supports, cross_support_min=1, instance_count=2
+        )
+        assert [n["note_index"] for n in kept] == [127]
+        kept = _apply_cross_instance_support(
+            section_notes,
+            spans,
+            supports,
+            cross_support_min=1,
+            instance_count=2,
+            protected={126, 127, 128},
+        )
+        assert [n["note_index"] for n in kept] == [126, 127, 128]
+
+    def test_protected_set_covers_endpoints_not_members(self):
+        arts = [
+            _pair("hammer", 0, 1, 1, 0, 3),
+            {
+                "type": "bend",
+                "note_index": 6,
+                "string": 3,
+                "fret": 3,
+                "target_semitones": 2,
+                "member_note_indices": [7],
+                "evidence": {},
+            },
+            {"type": "harmonic", "note_index": 8, "open_string": 1, "node_fret": 12},
+            {"type": "bend"},  # malformed — contributes nothing
+        ]
+        assert _articulation_note_indices(arts) == {0, 1, 6, 8}
+
+
+class TestWindowEdgeAnchor:
+    """GAP 1: an articulation endpoint within _ARTIC_EDGE_EPSILON before
+    the section window is anchored into the section when its partner is
+    inside; ordinary out-of-window notes stay excluded. LBTD's A|0h3
+    from-note (t=0.39s) misses [song_full_demo] (starts 0.4s) by 0.01s."""
+
+    def _notes(self):
+        return [
+            _note(0.39, 0.62, 45, 1, 0, 0, note_index=0, velocity=116),  # 0.01s early
+            _note(0.64, 0.83, 48, 1, 3, 1, note_index=1, velocity=72),
+            _note(0.30, 0.50, 52, 2, 2, 2, note_index=9, velocity=90),  # ordinary early
+        ]
+
+    def test_endpoint_just_before_window_is_anchored(self):
+        arts = [_pair("hammer", 0, 1, 1, 0, 3)]
+        got = _collect_section_notes(self._notes(), arts, 0.4, 20.8)
+        assert [n["note_index"] for n in got] == [0, 1]
+
+    def test_ordinary_early_note_stays_excluded(self):
+        # note_index 9 starts inside the epsilon band (0.30 >= 0.25) but
+        # is no articulation endpoint → excluded; without articulations
+        # the collection is the plain window filter.
+        got = _collect_section_notes(self._notes(), [], 0.4, 20.8)
+        assert [n["note_index"] for n in got] == [1]
+
+    def test_endpoint_beyond_epsilon_not_anchored(self):
+        notes = [
+            _note(0.2, 0.45, 45, 1, 0, 0, note_index=0),  # 0.2 < 0.4 - 0.15
+            _note(0.64, 0.83, 48, 1, 3, 1, note_index=1),
+        ]
+        arts = [_pair("hammer", 0, 1, 1, 0, 3)]
+        got = _collect_section_notes(notes, arts, 0.4, 20.8)
+        assert [n["note_index"] for n in got] == [1]
+
+    def test_partner_must_be_inside_window(self):
+        # The TO note falls after the window end, so nothing anchors the
+        # FROM note — only the unrelated in-window note is collected.
+        notes = self._notes() + [_note(0.5, 0.55, 57, 3, 2, 3, note_index=3)]
+        arts = [_pair("hammer", 0, 1, 1, 0, 3)]
+        got = _collect_section_notes(notes, arts, 0.4, 0.6)
+        assert [n["note_index"] for n in got] == [3]
+
+    def test_anchor_refused_when_another_window_owns_the_note(self):
+        # Temporally adjacent canonical windows (prev end == next start):
+        # the would-be anchor at 0.39 lies inside another section's
+        # [0.0, 0.4) window, which owns and draws it — anchoring it here
+        # too would render and count the note twice.
+        arts = [_pair("hammer", 0, 1, 1, 0, 3)]
+        got = _collect_section_notes(self._notes(), arts, 0.4, 20.8, other_windows=[(0.0, 0.4)])
+        assert [n["note_index"] for n in got] == [1]
+
+    def test_anchor_kept_when_other_windows_are_elsewhere(self):
+        # Other sections' windows that don't contain the note leave the
+        # epsilon anchor intact.
+        arts = [_pair("hammer", 0, 1, 1, 0, 3)]
+        got = _collect_section_notes(self._notes(), arts, 0.4, 20.8, other_windows=[(30.0, 40.0)])
+        assert [n["note_index"] for n in got] == [0, 1]
+
+    def test_render_anchors_edge_endpoint_end_to_end(self, tmp_path):
+        # Through render(): the from-note 0.01s before the window renders
+        # its 0h3 and the section header counts it.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path / "cache")
+        paths.frets_json.write_text(
+            json.dumps(
+                {
+                    "notes": [
+                        _note(0.39, 0.62, 45, 1, 0, 0, note_index=0, velocity=116),
+                        _note(0.64, 0.83, 48, 1, 3, 1, note_index=1, velocity=72),
+                    ],
+                    "articulations": [_pair("hammer", 0, 1, 1, 0, 3)],
+                }
+            )
+        )
+        paths.sections_json.write_text(
+            json.dumps(
+                {
+                    "video_id": "aaa11111111",
+                    "structural_summary": "",
+                    "sections": [
+                        {
+                            "label": "song_full_demo",
+                            "description": "",
+                            "chord_progression": ["A"],
+                            "instances": [{"start": 0.4, "end": 4.0, "demo_quality": "full-tempo"}],
+                        }
+                    ],
+                }
+            )
+        )
+        text = render(paths, output_root=tmp_path / "out").read_text()
+        assert "0h3" in text
+        assert "(2 notes" in text
+
+    def test_render_adjacent_windows_never_draw_a_note_twice(self, tmp_path):
+        # Two sections with temporally adjacent canonical windows and a
+        # hammer pair straddling the boundary: the from-note (t=2.3, fret
+        # 7) belongs to [verse] and must render exactly once — [chorus]
+        # must not epsilon-anchor it on top. Neither section can draw the
+        # connector, so BOTH footnote it with the window-edge-aware
+        # wording (no silent drop, no spurious "dropped" blame).
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path / "cache")
+        paths.frets_json.write_text(
+            json.dumps(
+                {
+                    "notes": [
+                        _note(2.3, 2.45, 52, 1, 7, 0, note_index=0, velocity=100),
+                        _note(2.5, 2.7, 54, 1, 9, 1, note_index=1, velocity=70),
+                    ],
+                    "articulations": [_pair("hammer", 0, 1, 1, 7, 9)],
+                }
+            )
+        )
+        paths.sections_json.write_text(
+            json.dumps(
+                {
+                    "video_id": "aaa11111111",
+                    "structural_summary": "",
+                    "sections": [
+                        {
+                            "label": "verse",
+                            "description": "",
+                            "chord_progression": ["A"],
+                            "instances": [{"start": 0.4, "end": 2.4, "demo_quality": "full-tempo"}],
+                        },
+                        {
+                            "label": "chorus",
+                            "description": "",
+                            "chord_progression": ["D"],
+                            "instances": [{"start": 2.4, "end": 4.4, "demo_quality": "full-tempo"}],
+                        },
+                    ],
+                }
+            )
+        )
+        text = render(paths, output_root=tmp_path / "out").read_text()
+        a_lines = [ln for ln in text.splitlines() if ln.lstrip().startswith("A|")]
+        assert sum(ln.count("7") for ln in a_lines) == 1  # from-note drawn once
+        assert sum(ln.count("9") for ln in a_lines) == 1  # to-note drawn once
+        assert "7h9" not in text  # pair straddles the windows; no connector
+        assert text.count("endpoint note absent from this section's layout") == 2
+
+
+class TestNoSilentDropInvariant:
+    """GAP 3a: every in-window articulation either renders its mark or
+    leaves a footnote — no silent connector drops."""
+
+    @staticmethod
+    def _mark_count(tab: str) -> int:
+        # Tab-body lines contain only '-', '|', digits and articulation
+        # chars after the string label, so counting h/p/b//\\ chars plus
+        # '<' tokens counts exactly the drawn marks. Lines without '|'
+        # (e.g. the blank line between wrapped systems) are skipped.
+        count = 0
+        for line in tab.splitlines():
+            _, sep, body = line.partition("|")
+            if not sep:
+                continue
+            count += sum(body.count(c) for c in "hpb/\\")
+            count += body.count("<")
+        return count
+
+    @staticmethod
+    def _omission_count(layout_notes: list[str]) -> int:
+        return sum(
+            1
+            for s in layout_notes
+            if "connector omitted" in s or "bend mark" in s or "mark omitted" in s
+        )
+
+    def test_marks_plus_footnotes_cover_every_articulation(self):
+        notes, artics = _five_type_fixture()
+        # Simulate earlier-stage drops: the hammer's FROM note (idx 0),
+        # the slide's TO note (idx 5) and the harmonic note (idx 8).
+        kept = [
+            n
+            for n in _apply_articulations_prelayout(notes, artics)
+            if n["note_index"] not in {0, 5, 8}
+        ]
+        tab, _, layout_notes, _ = _render_section_tab(
+            kept,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            articulations=artics,
+        )
+        # Drawn: pull 'p' + bend 'b' = 2 marks; footnoted: hammer, slide,
+        # harmonic = 3 omissions → all 5 articulations accounted for.
+        assert self._mark_count(tab) == 2
+        assert self._omission_count(layout_notes) == 3
+        assert self._mark_count(tab) + self._omission_count(layout_notes) == len(artics)
+
+    def test_articulation_footnotes_exempt_from_layout_cap(self):
+        # CAP-PROOF: 11 same-string notes in one cluster → 10 collision
+        # footnotes (over the cap of 8) PLUS an orphaned pair whose
+        # endpoints never reached layout. The articulation footnote must
+        # come FIRST and survive the cap; the "+N more" line collapses
+        # only the collision footnotes.
+        notes = [_note(0.0, 0.5, 64 + f, 5, f, 0) for f in range(11)]
+        _, _, layout_notes, _ = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0],
+            articulations=[_pair("pull", 90, 91, 5, 3, 0)],
+        )
+        assert layout_notes[0] == (
+            "pull-off 3->0 on e string (endpoint note absent from this "
+            "section's layout — dropped earlier or outside this window; "
+            "connector omitted)"
+        )
+        assert layout_notes[-1] == "… (+2 more layout conflicts)"
+        assert len(layout_notes) == 10  # 1 artic + 8 collisions + '+N more'
+        assert self._omission_count(layout_notes) == 1
+
+    def test_both_endpoints_dropped_footnoted(self):
+        # Both halves gone (e.g. short-and-weak gate + dedupe) — the
+        # footnote has no timestamp but still names the figure.
+        notes = [_note(2.0, 2.4, 52, 2, 2, 9, note_index=9)]
+        _, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[_pair("pull", 0, 1, 5, 3, 0)],
+        )
+        assert symbols == []
+        assert layout_notes == [
+            "pull-off 3->0 on e string (endpoint note absent from this "
+            "section's layout — dropped earlier or outside this window; "
+            "connector omitted)"
+        ]
+
+    def test_bend_struck_note_dropped_footnoted(self):
+        notes = [_note(2.0, 2.4, 52, 2, 2, 9, note_index=9)]
+        bend = {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": 2,
+            "member_note_indices": [],
+            "evidence": {},
+        }
+        _, _, layout_notes, symbols = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=[bend]
+        )
+        assert symbols == []
+        assert layout_notes == ["bend 3->5 (struck note dropped before layout; bend mark omitted)"]
+
+    def test_harmonic_note_dropped_footnoted(self):
+        notes = [_note(2.0, 2.4, 52, 2, 2, 9, note_index=9)]
+        harm = {"type": "harmonic", "note_index": 5, "open_string": 1, "node_fret": 12}
+        _, _, layout_notes, symbols = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=[harm]
+        )
+        assert symbols == []
+        assert layout_notes == [
+            "natural harmonic <12> on A string (note dropped before layout; mark omitted)"
+        ]
+
+    def test_articulations_windowed_per_section(self):
+        # The invariant relies on render() handing each section ONLY its
+        # own articulations: an entry counts as in-window when any
+        # referenced RAW note starts inside [start, end).
+        arts = [
+            _pair("hammer", 0, 1, 1, 0, 3),  # notes at 0.39 / 0.64
+            _pair("pull", 4, 5, 5, 3, 0),  # notes at 10.1 / 10.4
+            {
+                "type": "bend",
+                "note_index": 7,
+                "string": 3,
+                "fret": 3,
+                "target_semitones": 2,
+                "member_note_indices": [],
+                "evidence": {},
+            },  # note at 20.0
+        ]
+        starts = {0: 0.39, 1: 0.64, 4: 10.1, 5: 10.4, 7: 20.0}
+        assert _articulations_in_window(arts, starts, 0.4, 5.0) == [arts[0]]
+        assert _articulations_in_window(arts, starts, 5.0, 15.0) == [arts[1]]
+        assert _articulations_in_window(arts, starts, 15.0, 25.0) == [arts[2]]
+
+
+class TestBendTargetFootnote:
+    """GAP 3b: a drawn bend footnotes the measured target pitch — the
+    '3b4' token names a target FRET, not what the bend should sound
+    like."""
+
+    def _bend(self, semitones=1):
+        return {
+            "type": "bend",
+            "note_index": 10,
+            "string": 3,
+            "fret": 3,
+            "target_semitones": semitones,
+            "member_note_indices": [],
+            "evidence": {},
+        }
+
+    def test_drawn_bend_names_target_pitch(self):
+        # A#3 (58) at G|3 bent +1 semitone → 'b4 = bend toward B3'.
+        notes = [_note(0.0, 0.6, 58, 3, 3, 0, note_index=10)]
+        tab, _, layout_notes, symbols = _render_section_tab(
+            notes,
+            line_width=72,
+            beat_times=[0.0, 1.0, 2.0, 3.0],
+            articulations=[self._bend()],
+        )
+        assert "3b4" in _line(tab, "G")
+        assert symbols == ["b"]
+        assert layout_notes == ["b4 = bend toward B3"]
+
+    def test_identical_targets_footnoted_once(self):
+        notes = [
+            _note(0.0, 0.4, 58, 3, 3, 0, note_index=10),
+            _note(1.0, 1.4, 58, 3, 3, 1, note_index=12),
+        ]
+        bends = [self._bend(), dict(self._bend(), note_index=12)]
+        _, _, layout_notes, _ = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=bends
+        )
+        assert layout_notes == ["b4 = bend toward B3"]
+
+    def test_dropped_bend_mark_has_no_target_footnote(self):
+        # Re-strung struck note: 'bend mark dropped' footnote only.
+        notes = [_note(0.0, 0.6, 58, 4, 6, 0, note_index=10)]
+        _, _, layout_notes, _ = _render_section_tab(
+            notes, line_width=72, beat_times=[0.0, 1.0, 2.0, 3.0], articulations=[self._bend()]
+        )
+        assert len(layout_notes) == 1
+        assert "bend mark dropped" in layout_notes[0]
+        assert "bend toward" not in layout_notes[0]

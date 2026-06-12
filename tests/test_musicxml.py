@@ -160,3 +160,250 @@ class TestRenderMusicxml:
         capo_el = root.find(".//capo")
         assert capo_el is not None
         assert capo_el.text == "3"
+
+
+class TestMusicxmlArticulations:
+    """Articulation notations: slur + hammer-on/pull-off pairs, slides,
+    bends, natural harmonics — and byte-stability without articulations."""
+
+    def _make_inputs(self):
+        sections_data = {"video_id": "test123"}
+        rendered = [
+            RenderedSection(
+                label="riff",
+                description="",
+                canonical_start=0.0,
+                canonical_end=8.0,
+                chord_progression=["A"],
+                cluster_count=4,
+                note_count=4,
+                ascii_tab="(unused)",
+                tempo_bpm=120.0,
+            )
+        ]
+        tuning = TuningInfo(
+            label="Standard",
+            capo=0,
+            strings_midi=[40, 45, 50, 55, 59, 64],
+            source="audio",
+            confidence=1.0,
+            string_letters=["e", "B", "G", "D", "A", "E"],
+        )
+        notes_by_section = {
+            "riff": [
+                {"start": 0.0, "pitch": 45, "string": 1, "fret": 0, "note_index": 0},
+                {"start": 1.0, "pitch": 48, "string": 1, "fret": 3, "note_index": 1},
+                {"start": 2.0, "pitch": 58, "string": 3, "fret": 3, "note_index": 2},
+                {"start": 3.0, "pitch": 57, "string": 1, "fret": 12, "note_index": 3},
+            ]
+        }
+        beat_times_by_section = {"riff": [float(t) for t in range(9)]}
+        return sections_data, rendered, tuning, notes_by_section, beat_times_by_section
+
+    def test_hammer_emits_slur_and_technical_pair(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        artics = [
+            {
+                "type": "hammer",
+                "from_note_index": 0,
+                "note_index": 1,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        slurs = root.findall(".//slur")
+        assert [s.get("type") for s in slurs] == ["start", "stop"]
+        hammers = root.findall(".//technical/hammer-on")
+        assert [h.get("type") for h in hammers] == ["start", "stop"]
+        assert hammers[0].text == "H"
+        assert hammers[1].text is None
+
+    def test_pull_emits_pull_off_elements(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        # A real pull-off's source precedes its destination in time:
+        # e|3 (idx 10, t=4) → e|0 (idx 11, t=5).
+        ns["riff"].extend(
+            [
+                {"start": 4.0, "pitch": 67, "string": 5, "fret": 3, "note_index": 10},
+                {"start": 5.0, "pitch": 64, "string": 5, "fret": 0, "note_index": 11},
+            ]
+        )
+        artics = [
+            {
+                "type": "pull",
+                "from_note_index": 10,
+                "note_index": 11,
+                "string": 5,
+                "from_fret": 3,
+                "to_fret": 0,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        pulls = root.findall(".//technical/pull-off")
+        assert [p.get("type") for p in pulls] == ["start", "stop"]
+        assert pulls[0].text == "P"
+
+    def test_slide_emits_slide_elements(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        artics = [
+            {
+                "type": "slide",
+                "from_note_index": 0,
+                "note_index": 1,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        slides = root.findall(".//slide")
+        assert [s.get("type") for s in slides] == ["start", "stop"]
+
+    def test_bend_and_harmonic_marks(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        artics = [
+            {
+                "type": "bend",
+                "note_index": 2,
+                "string": 3,
+                "fret": 3,
+                "target_semitones": 2,
+                "member_note_indices": [],
+                "evidence": {},
+            },
+            {"type": "harmonic", "note_index": 3, "open_string": 1, "node_fret": 12},
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        alter = root.find(".//technical/bend/bend-alter")
+        assert alter is not None
+        assert alter.text == "2"
+        assert root.find(".//technical/harmonic/natural") is not None
+
+    def test_restrung_pair_half_emits_no_marks(self):
+        # The TO note was moved to another string (what a verified-shape
+        # override does). A cross-string hammer-on is impossible notation
+        # and the same run's tab.txt drops the connector — the XML must
+        # agree instead of emitting slur + hammer-on anyway.
+        sd, rd, tu, ns, bs = self._make_inputs()
+        ns["riff"][1]["string"] = 2
+        artics = [
+            {
+                "type": "hammer",
+                "from_note_index": 0,
+                "note_index": 1,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.findall(".//slur") == []
+        assert root.findall(".//technical/hammer-on") == []
+
+    def test_refretted_pair_half_emits_no_marks(self):
+        # Same gating on the fret axis: the TO note's emitted fret no
+        # longer matches the articulation's to_fret evidence.
+        sd, rd, tu, ns, bs = self._make_inputs()
+        ns["riff"][1]["fret"] = 5
+        artics = [
+            {
+                "type": "hammer",
+                "from_note_index": 0,
+                "note_index": 1,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.findall(".//slur") == []
+        assert root.findall(".//technical/hammer-on") == []
+
+    def test_bend_on_moved_note_emits_no_bend(self):
+        # The struck note no longer sits at the measured (string, fret) —
+        # the bend evidence is void, mirroring the ASCII renderer's
+        # "bend mark dropped" behavior.
+        sd, rd, tu, ns, bs = self._make_inputs()
+        ns["riff"][2]["string"] = 4
+        ns["riff"][2]["fret"] = 8
+        artics = [
+            {
+                "type": "bend",
+                "note_index": 2,
+                "string": 3,
+                "fret": 3,
+                "target_semitones": 2,
+                "member_note_indices": [],
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.findall(".//technical/bend") == []
+
+    def test_harmonic_not_at_node_position_emits_no_harmonic(self):
+        # The prelayout pass re-strings a valid harmonic to its
+        # (open_string, node_fret) before notes reach the exporter; a
+        # note still at the Viterbi position means the entry was rejected
+        # there, so no <natural/> here either.
+        sd, rd, tu, ns, bs = self._make_inputs()
+        ns["riff"][3]["string"] = 3
+        ns["riff"][3]["fret"] = 2
+        artics = [{"type": "harmonic", "note_index": 3, "open_string": 1, "node_fret": 12}]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.find(".//technical/harmonic") is None
+
+    def test_orphaned_pair_emits_no_dangling_slur(self):
+        # One half references a note that is not being emitted (e.g. a
+        # hidden bend member or a filtered note) — no slur at all.
+        sd, rd, tu, ns, bs = self._make_inputs()
+        artics = [
+            {
+                "type": "hammer",
+                "from_note_index": 0,
+                "note_index": 99,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.findall(".//slur") == []
+        assert root.findall(".//technical/hammer-on") == []
+
+    def test_malformed_entries_never_crash(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        artics = [{"type": "bend"}, {"type": "hammer", "note_index": "x"}, {"type": "?"}]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.tag == "score-partwise"
+
+    def test_no_articulations_byte_identical(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        base = render_musicxml(sd, rd, tu, ns, bs)
+        assert render_musicxml(sd, rd, tu, ns, bs, articulations=None) == base
+        assert render_musicxml(sd, rd, tu, ns, bs, articulations=[]) == base
+
+    def test_notes_without_note_index_tolerated(self):
+        sd, rd, tu, ns, bs = self._make_inputs()
+        for n in ns["riff"]:
+            del n["note_index"]
+        artics = [
+            {
+                "type": "hammer",
+                "from_note_index": 0,
+                "note_index": 1,
+                "string": 1,
+                "from_fret": 0,
+                "to_fret": 3,
+                "evidence": {},
+            }
+        ]
+        root = ET.fromstring(render_musicxml(sd, rd, tu, ns, bs, articulations=artics))
+        assert root.findall(".//slur") == []

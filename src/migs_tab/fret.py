@@ -753,6 +753,22 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             }
         )
 
+    # Articulation detection (hammer/pull/slide, bends, natural harmonics)
+    # runs over the finished note records when the stem exists — every
+    # detector is audio-gated, so there is nothing to detect without audio.
+    # Lazy import like salience: articulations pulls in librosa.
+    articulation_records: list[dict] = []
+    if evidence_contexts is not None:
+        from . import articulations
+
+        articulation_records = articulations.detect_articulations(
+            note_records,
+            paths.guitar_stem,
+            _ACTIVE_TUNING,
+            contexts=evidence_contexts,
+            window_seconds=_EVIDENCE_WINDOW_SECONDS,
+        )
+
     out = {
         "note_count": len(note_records),
         "cluster_count": len(cluster_records),
@@ -777,6 +793,8 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     }
     if evidence_contexts is not None:
         out["overtone_artifacts"] = overtone_artifacts
+    if articulation_records:
+        out["articulations"] = articulation_records
     paths.frets_json.write_text(json.dumps(out, indent=2))
     return paths
 

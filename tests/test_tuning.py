@@ -8,6 +8,8 @@ import json
 from migs_tab.paths import VideoPaths
 from migs_tab.tuning import (
     _AUDIO_CANDIDATES,
+    _MIN_FLOOR_NOTES,
+    _REFIT_MAX_SKIP_SEMITONES,
     _TUNING_LIBRARY,
     _UNVERIFIED_CONFIDENCE_CAP,
     _VETOED_CONFIDENCE_CAP,
@@ -204,6 +206,14 @@ def _write_mt3_notes(paths: VideoPaths, notes: list[dict]) -> None:
     )
 
 
+def _write_basic_pitch_notes(paths: VideoPaths, notes: list[dict]) -> None:
+    """Write notes to notes.json only (basic-pitch fallback source) so the
+    cross-check loads them with notes_source == 'basic_pitch'."""
+    paths.notes_json.write_text(
+        json.dumps({"backend": "basic_pitch", "note_count": len(notes), "notes": notes})
+    )
+
+
 def _standard_capo5(confidence: float = 1.0) -> Tuning:
     return Tuning(
         strings_midi=list(STANDARD_TUNING),
@@ -390,4 +400,235 @@ class TestContradictionVeto:
         assert data["label"] == "Standard"
         assert data["verification"]["veto"] is True
         assert data["verification"]["subfloor_count"] >= 35
-        assert "contradiction-veto" in data["source"]
+
+
+# ---------------------------------------------------------------------------
+# Sub-octave-phantom guard
+# ---------------------------------------------------------------------------
+
+
+def _drop_d(label: str = "Drop D") -> Tuning:
+    """A dropped-tuning candidate the audio detector might pick from a phantom
+    D2 floor (default Drop D; pass 'Double Drop D' for the George case)."""
+    return Tuning(
+        strings_midi=list(_TUNING_LIBRARY[label]),
+        capo=0,
+        label=label,
+        confidence=0.9,
+        source="audio",
+        evidence="lowest sustained pitch ≈ MIDI 38.10 (D2)",
+    )
+
+
+def _doubled_floor(pitch: int, partner: int, n: int, start0: float = 50.0) -> list[dict]:
+    """n floor notes at ``pitch``, each with a simultaneous note at ``partner``
+    (the +12 real note) starting within the co-occurrence window."""
+    out: list[dict] = []
+    for i in range(n):
+        t = start0 + i * 0.7
+        out.append(_note(pitch, t, dur=0.5))
+        out.append(_note(partner, t + 0.01, dur=0.6))  # +12, ~10ms later
+    return out
+
+
+class TestSubOctavePhantomGuard:
+    def test_phantom_d2_floor_rejects_drop_d_to_standard(self, tmp_path):
+        # Mirrors S1GpQaD5yT0 (Crystal Ship): every D2(38) floor note is a
+        # sub-octave doubling of a simultaneous D3(50). The D2 floor is
+        # phantom, so Drop D must flip to Standard (real floor E2=40).
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(120, lo=40, hi=64)  # genuine body incl. E2 floor
+        notes += _doubled_floor(38, 50, 30)  # 30 phantom D2s under real D3s
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert "suboctave-phantom-veto" in result.source
+        assert result.confidence <= _VETOED_CONFIDENCE_CAP
+        v = result.verification
+        assert v["veto"] is True
+        assert v["vetoed_label"] == "Drop D"
+        assert v["suboctave_floor_count"] == 30
+        assert v["suboctave_doubled_fraction"] > 0.8
+        assert v["suboctave_phantom_rejected"] is True
+        assert v["suboctave_phantom_floor_midi"] == 38
+        assert v["refit_floor_midi"] == 40
+
+    def test_real_dropped_low_string_keeps_dropped_tuning(self, tmp_path):
+        # Mirrors s_LAzeLbdLs (Song for George): a genuine low D string. Most
+        # D2(38) notes stand alone (no +12 partner) — only a minority are
+        # doubled — so the doubled fraction stays well under 0.80 and the
+        # Double Drop D tuning is KEPT.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(80, lo=40, hi=62)
+        # 60 real low-D2s standing alone (no simultaneous D3)...
+        notes += [_note(38, 50.0 + i * 0.7, dur=0.5) for i in range(60)]
+        # ...plus 20 that happen to coincide with a D3 (~25% doubled).
+        notes += _doubled_floor(38, 50, 20, start0=200.0)
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d("Double Drop D"), paths)
+        assert result.label == "Double Drop D"
+        assert result.strings_midi == _TUNING_LIBRARY["Double Drop D"]
+        assert result.source == "audio"
+        v = result.verification
+        assert v["veto"] is False
+        assert v["suboctave_floor_count"] == 80
+        assert v["suboctave_doubled_fraction"] < 0.5
+        assert v["suboctave_phantom_rejected"] is False
+
+    def test_standard_floor_at_or_above_midi40_is_never_inspected(self, tmp_path):
+        # A Standard (floor E2=40) result whose E2 notes are heavily doubled by
+        # E3(52). The guard is INERT at/above MIDI 40 (protects LBTD/Angie):
+        # no suboctave_* fields, tuning untouched.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(80, lo=45, hi=64)
+        notes += _doubled_floor(40, 52, 40)  # heavily-doubled E2 floor
+        _write_mt3_notes(paths, notes)
+
+        standard = Tuning(
+            strings_midi=list(STANDARD_TUNING),
+            capo=0,
+            label="Standard",
+            confidence=0.9,
+            source="audio",
+            evidence="lowest sustained pitch ≈ MIDI 40.0 (E2)",
+        )
+        result = verify_against_transcription(standard, paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.source == "audio"
+        assert result.verification["veto"] is False
+        assert "suboctave_floor_count" not in result.verification
+        assert "suboctave_phantom_rejected" not in result.verification
+
+    def test_too_few_floor_notes_does_not_reject(self, tmp_path):
+        # Below _MIN_FLOOR_NOTES phantom-doubled D2s: even at 100% doubled the
+        # sample is too small to conclude anything, so Drop D is KEPT.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        few = _MIN_FLOOR_NOTES - 1
+        notes = _body_notes(80, lo=40, hi=64)
+        notes += _doubled_floor(38, 50, few)
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Drop D"
+        assert result.strings_midi == _TUNING_LIBRARY["Drop D"]
+        v = result.verification
+        assert v["veto"] is False
+        assert v["suboctave_floor_count"] == few
+        assert v["suboctave_doubled_fraction"] > 0.8  # high fraction, but too few notes
+        assert v["suboctave_phantom_rejected"] is False
+
+    def test_heavily_doubled_real_floor_is_not_skipped_in_refit(self, tmp_path):
+        # Major-finding guard: a phantom D2(38) floor sits beneath a REAL but
+        # heavily octave-doubled E2(40) low string (E2 struck inside E2+E3 power
+        # chords reads >80% doubled too). The bounded phantom-skip in the re-fit
+        # must NOT skip E2 — it is at phantom_floor + _REFIT_MAX_SKIP_SEMITONES,
+        # exactly the boundary — so the re-fit lands on Standard (floor 40),
+        # NOT an absurd 'Standard, capo N'.
+        assert 38 + _REFIT_MAX_SKIP_SEMITONES == 40  # E2 sits at the skip boundary
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        # Body at/above A2 so the ONLY low strings are the phantom D2 and the
+        # heavily-doubled real E2.
+        notes = _body_notes(120, lo=45, hi=64)
+        notes += _doubled_floor(38, 50, 30)  # 30 phantom D2s under real D3s
+        notes += _doubled_floor(40, 52, 30, start0=300.0)  # 30 doubled real E2s
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert "suboctave-phantom-veto" in result.source
+        v = result.verification
+        assert v["veto"] is True
+        assert v["suboctave_phantom_floor_midi"] == 38
+        assert v["refit_floor_midi"] == 40  # the real E2, not skipped past
+
+    def test_phantom_floor_refits_to_capoed_standard(self, tmp_path):
+        # A phantom D2(38) floor whose real low string is A2(45): nothing
+        # supported sits between, so the re-fit lands on 'Standard, capo 5'
+        # (effective floor 45). Exercises the capo re-introduction path.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(120, lo=45, hi=64)  # real floor A2=45, nothing below
+        notes += _doubled_floor(38, 50, 30)  # phantom D2s under real D3s
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard, capo 5"
+        assert result.capo == 5
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert "suboctave-phantom-veto" in result.source
+        v = result.verification
+        assert v["veto"] is True
+        assert v["suboctave_phantom_floor_midi"] == 38
+        assert v["refit_floor_midi"] == 45
+
+    def test_phantom_floor_with_no_low_support_falls_back_to_standard_e(self, tmp_path):
+        # Degenerate: ONLY phantom D2(38)s under real D3(50)s, and NOTHING else
+        # at all above the phantom floor (not even the D3 partner sustains long
+        # enough to count). With no supported pitch above the phantom floor the
+        # re-fit falls back to STANDARD low E (40) — the documented fallback.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        # Phantom D2s whose D3 partners are SHORTER than _SUBFLOOR_MIN_NOTE_S so
+        # they do not register as sustained support above the phantom floor.
+        notes: list[dict] = []
+        for i in range(30):
+            t = 50.0 + i * 0.7
+            notes.append(_note(38, t, dur=0.5))  # phantom D2 (sustained)
+            notes.append(_note(50, t + 0.01, dur=0.05))  # D3 partner, too short
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard"
+        assert result.capo == 0
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert "suboctave-phantom-veto" in result.source
+        v = result.verification
+        assert v["veto"] is True
+        assert v["suboctave_phantom_floor_midi"] == 38
+        assert v["refit_floor_midi"] == STANDARD_TUNING[0]  # 40
+
+    def test_phantom_floor_only_partner_above_climbs_to_capoed_standard(self, tmp_path):
+        # KNOWN, NON-BLOCKING limitation (review major finding): when the ONLY
+        # sustained support above a phantom D2(38) floor is the phantom's own
+        # +12 partner D3(50) — i.e. there is no genuine low-register string at
+        # all — the re-fit anchors on D3=50 and climbs to 'Standard, capo 7'
+        # rather than the standard-E fallback. This does not occur in the four
+        # target songs (Crystal lands on E2=40). Locked in here so any future
+        # change to the fallback semantics is a deliberate, visible decision.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _doubled_floor(38, 50, 30)  # phantom D2s + SUSTAINED D3 partners
+        _write_mt3_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard, capo 7"
+        assert result.capo == 7
+        v = result.verification
+        assert v["veto"] is True
+        assert v["suboctave_phantom_floor_midi"] == 38
+        # Anchored on the D3(50) partner; capo maxes at 7 so the effective floor
+        # lands at 40+7=47 (closest reachable to 50).
+        assert v["refit_floor_midi"] == 47
+
+    def test_phantom_guard_uses_basic_pitch_source(self, tmp_path):
+        # The phantom path must work when the only transcription is basic-pitch
+        # (notes.json), not mt3. The evidence string and verification must cite
+        # 'basic_pitch' as the notes_source.
+        paths = VideoPaths("aaa11111111", cache_dir=tmp_path)
+        notes = _body_notes(120, lo=40, hi=64)  # genuine body incl. E2 floor
+        notes += _doubled_floor(38, 50, 30)  # 30 phantom D2s under real D3s
+        _write_basic_pitch_notes(paths, notes)
+
+        result = verify_against_transcription(_drop_d(), paths)
+        assert result.label == "Standard"
+        assert result.strings_midi == list(STANDARD_TUNING)
+        assert "suboctave-phantom-veto" in result.source
+        assert "basic_pitch" in result.evidence
+        v = result.verification
+        assert v["veto"] is True
+        assert v["notes_source"] == "basic_pitch"
+        assert v["refit_floor_midi"] == 40

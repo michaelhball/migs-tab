@@ -19,9 +19,12 @@ transcription** (``notes.mt3.json``, falling back to ``notes.json``) when one
 exists: sustained, repeated notes below the candidate's effective lowest
 sounding pitch (lowest open string + capo) are physically impossible, so they
 veto the candidate and we re-fit to the transcription's own pitch floor with
-reduced confidence (see :func:`verify_against_transcription`). If no
-transcription exists yet, the result is kept but marked unverified and its
-confidence is capped below 1.0.
+reduced confidence (see :func:`verify_against_transcription`). A symmetric
+guard catches the opposite error: a DROPPED tuning (floor below MIDI 40)
+whose low floor is only phantom sub-octave doublings of a real note an octave
+up is rejected and the floor raised to the real one. If no transcription
+exists yet, the result is kept but marked unverified and its confidence is
+capped below 1.0.
 
 Output is ``cache/<video_id>/tuning.json``:
 
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_left
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -475,6 +479,50 @@ _SUBFLOOR_VETO_MIN_FRACTION = 0.015
 _FLOOR_SUPPORT_MIN_COUNT = 3
 _FLOOR_SUPPORT_MIN_FRACTION = 0.15
 
+# --- Sub-octave-phantom guard (symmetric with the contradiction veto) ------
+# MT3/basic-pitch routinely emit a phantom note exactly an octave BELOW a
+# real note (a sub-octave doubling). When a song has a real open D string
+# (D3, MIDI 50 — present in BOTH standard and dropped tunings), the phantom
+# D2 (MIDI 38) notes beneath those D3s make the audio detector conclude the
+# lowest sustained pitch is D2 and pick a DROPPED tuning. This runs BEFORE
+# the fret-stage overtone filter, so the floor needs its own protection here.
+#
+# A floor note is a phantom if it co-occurs (start within the window below)
+# with a note exactly 12 semitones above it. The guard is INERT unless the
+# chosen effective low string is BELOW standard low E (MIDI 40): a dropped
+# floor is the only thing a phantom sub-octave can fabricate, and standard /
+# capo floors (>= 40) must be left exactly as the contradiction veto leaves
+# them (protects LBTD's E2 floor and Angie).
+_DROPPED_FLOOR_CEILING_MIDI = 40  # guard only inspects floors strictly below this
+_SUBOCTAVE_COOCCUR_WINDOW_S = 0.080  # +12 partner must start within ~80ms
+
+# Need a real handful of floor notes before the doubled fraction is meaningful
+# — a couple of doubled notes prove nothing about the tuning.
+_MIN_FLOOR_NOTES = 8
+
+# When re-fitting above a phantom floor, the upward scan skips pitches that are
+# themselves sub-octave phantoms. A real low string heavily played inside
+# octave / power chords (e.g. E2+E3) reads as >80% doubled too — without a
+# bound, the scan would skip it and climb to an absurd floor (Standard, capo N).
+# The library's dropped tunings all sit at D2=38, exactly TWO semitones below
+# the standard low string E2=40, so the real floor (E2) is at phantom_floor+2.
+# The skip is therefore allowed only STRICTLY below phantom_floor + this bound:
+# pitches up to one semitone above the phantom can be artifacts, but a doubled
+# pitch AT phantom_floor+2 (the standard low E) is a genuine octave-chorded
+# string and must be accepted, not skipped.
+_REFIT_MAX_SKIP_SEMITONES = 2
+
+# Reject the dropped floor when this fraction of its notes are sub-octave
+# doublings. Calibrated on cached videos (window 80ms):
+#   S1GpQaD5yT0 (Crystal Ship, really Standard): D2 floor, 66 notes, 0.98
+#     doubled by a simultaneous D3 → PHANTOM, must reject Drop D → Standard.
+#   s_LAzeLbdLs (Song for George, really Double Drop D): D2 floor, 337 notes,
+#     only 0.29 doubled → a REAL dropped low string, must NOT reject.
+# 0.80 sits well clear of both ends (margin ~0.18 above George, ~0.18 below
+# Crystal), so neither model noise on George nor a sparser-doubled phantom
+# can land on the wrong side.
+_SUBOCTAVE_PHANTOM_FRACTION = 0.80
+
 # MT3's General-MIDI program for transcribed speech/singing — the only
 # channel safe to drop wholesale (other non-guitar channels carry real
 # guitar notes; see mt3.py).
@@ -602,6 +650,95 @@ def _subfloor_evidence(notes: list[dict], effective_low: int) -> _SubfloorEviden
     )
 
 
+@dataclass
+class _PhantomFloorEvidence:
+    """Summary of whether a dropped tuning's floor pitch is sub-octave noise."""
+
+    floor_midi: int  # the candidate's effective low pitch examined
+    floor_count: int  # notes sitting at exactly that pitch
+    doubled_count: int  # of those, ones with a +12 partner within the window
+    doubled_fraction: float  # doubled_count / floor_count
+    phantom: bool  # floor is a sub-octave artifact → reject the dropped tuning
+
+
+def _phantom_floor_evidence(notes: list[dict], floor_midi: int) -> _PhantomFloorEvidence:
+    """Decide whether the notes at ``floor_midi`` are sub-octave doublings.
+
+    A floor note is treated as phantom when another note exactly 12 semitones
+    above it starts within ``_SUBOCTAVE_COOCCUR_WINDOW_S`` — the model's
+    octave-below doubling of a real note. When (almost) every floor note is
+    such a doubling there is no genuine string at that pitch.
+    """
+    at_floor = [n for n in notes if n["pitch"] == floor_midi]
+    partner_starts = sorted(n["start"] for n in notes if n["pitch"] == floor_midi + 12)
+
+    doubled = 0
+    for n in at_floor:
+        # A +12 partner whose onset is within the window of this note's onset.
+        lo = n["start"] - _SUBOCTAVE_COOCCUR_WINDOW_S
+        hi = n["start"] + _SUBOCTAVE_COOCCUR_WINDOW_S
+        idx = bisect_left(partner_starts, lo)
+        if idx < len(partner_starts) and partner_starts[idx] <= hi:
+            doubled += 1
+
+    floor_count = len(at_floor)
+    fraction = doubled / floor_count if floor_count else 0.0
+    phantom = floor_count >= _MIN_FLOOR_NOTES and fraction > _SUBOCTAVE_PHANTOM_FRACTION
+    return _PhantomFloorEvidence(
+        floor_midi=floor_midi,
+        floor_count=floor_count,
+        doubled_count=doubled,
+        doubled_fraction=fraction,
+        phantom=phantom,
+    )
+
+
+def _refit_above_phantom_floor(
+    phantom_floor: int, notes: list[dict], original: Tuning
+) -> tuple[str, list[int], int]:
+    """Re-fit a dropped tuning whose floor was sub-octave noise.
+
+    The real floor is the lowest pitch the player actually sustains once the
+    phantom sub-octave is removed: scan upward from one semitone above the
+    phantom floor for the first non-junk pitch that has real support
+    (>= _FLOOR_SUPPORT_MIN_COUNT sustained instances) AND is not itself a
+    sub-octave phantom of a note 12 st higher. For Crystal Ship that skips the
+    14 residual phantom D2(38)s and lands on Standard's E2(40, 52 instances).
+
+    The phantom-skip is BOUNDED to _REFIT_MAX_SKIP_SEMITONES above the phantom
+    floor: a real low string that is itself heavily octave-doubled (E2 struck
+    inside E2+E3 power chords reads >80% doubled too) must not be skipped, or
+    the scan would climb past the true floor to an absurd capo'd standard. The
+    fabricating phantom is always one semitone below the standard low string in
+    the library's dropped tunings, so the real floor is within the bound.
+    """
+    sustained = [n for n in notes if (n["end"] - n["start"]) >= _SUBFLOOR_MIN_NOTE_S]
+    by_pitch = Counter(
+        n["pitch"]
+        for n in sustained
+        if _TRANSCRIPTION_JUNK_FLOOR_MIDI <= n["pitch"] and n["pitch"] > phantom_floor
+    )
+    real_floor: int | None = None
+    skip_ceiling = phantom_floor + _REFIT_MAX_SKIP_SEMITONES
+    for pitch in sorted(by_pitch):
+        if by_pitch[pitch] < _FLOOR_SUPPORT_MIN_COUNT:
+            continue
+        # Skip a pitch that is itself a sub-octave phantom of a +12 partner —
+        # but only strictly within the bound above the phantom floor. AT or past
+        # the bound (the standard low string E2=40 sits exactly there for a D2=38
+        # phantom) a heavily-doubled pitch is a genuine (octave-chorded) low
+        # string, so accept it as the real floor instead of climbing past it.
+        if pitch < skip_ceiling and _phantom_floor_evidence(sustained, pitch).phantom:
+            continue
+        real_floor = pitch
+        break
+    # Fall back to standard low E when nothing else carries support: a phantom
+    # dropped floor with no real low string below the standard one IS standard.
+    if real_floor is None:
+        real_floor = STANDARD_TUNING[0]
+    return _refit_to_floor(real_floor, original)
+
+
 def _refit_to_floor(floor_midi: int, original: Tuning) -> tuple[str, list[int], int]:
     """Pick the (tuning, capo) candidate whose effective low pitch best
     explains the transcription's supported floor. Tie-breaks: smaller capo,
@@ -614,6 +751,55 @@ def _refit_to_floor(floor_midi: int, original: Tuning) -> tuple[str, list[int], 
         return (delta, capo, same_strings)
 
     return min(_AUDIO_CANDIDATES, key=score)
+
+
+def _reject_phantom_floor(
+    tuning: Tuning,
+    notes: list[dict],
+    notes_source: str,
+    phantom: _PhantomFloorEvidence,
+    verification: dict,
+) -> Tuning:
+    """Re-fit a dropped tuning whose low floor was a sub-octave phantom.
+
+    Mirrors the contradiction-veto re-fit, but in the OPPOSITE direction:
+    instead of lowering the floor for impossible sub-floor notes, it RAISES
+    the floor off a phantom that fabricated a dropped string.
+    """
+    best_label, best_midis, best_capo = _refit_above_phantom_floor(
+        phantom.floor_midi, notes, tuning
+    )
+    new_low = min(best_midis) + best_capo
+    # The guard only fires when doubled_fraction > _SUBOCTAVE_PHANTOM_FRACTION
+    # (0.80), so the max(_VETOED_CONFIDENCE_FLOOR, ...) of the contradiction
+    # path can never bind here; a phantom re-fit is always capped to exactly
+    # _VETOED_CONFIDENCE_CAP (0.75). Stated as a literal for clarity.
+    confidence = _VETOED_CONFIDENCE_CAP
+    final_label = best_label if best_capo == 0 else f"{best_label}, capo {best_capo}"
+    verification.update(
+        {
+            "veto": True,
+            "vetoed_label": tuning.label,
+            "suboctave_phantom_floor_midi": phantom.floor_midi,
+            "refit_floor_midi": new_low,
+        }
+    )
+    return Tuning(
+        strings_midi=list(best_midis),
+        capo=best_capo,
+        label=final_label,
+        confidence=round(confidence, 3),
+        source=f"{tuning.source}+suboctave-phantom-veto",
+        evidence=(
+            f"{tuning.evidence}; VETOED '{tuning.label}': its low floor MIDI "
+            f"{phantom.floor_midi} is a sub-octave phantom — "
+            f"{phantom.doubled_count}/{phantom.floor_count} "
+            f"({phantom.doubled_fraction:.1%}) of those {notes_source} notes are "
+            f"doubled by a simultaneous note 12 st above; re-fit to real floor "
+            f"MIDI {new_low} → {final_label}"
+        ),
+        verification=verification,
+    )
 
 
 def verify_against_transcription(tuning: Tuning, paths: VideoPaths) -> Tuning:
@@ -666,6 +852,21 @@ def verify_against_transcription(tuning: Tuning, paths: VideoPaths) -> Tuning:
     }
 
     if not evidence.veto:
+        # Sub-octave-phantom guard (symmetric with the contradiction veto):
+        # the audio detector can pick a DROPPED tuning whose only evidence for
+        # the low floor is phantom sub-octave doublings of a real note an
+        # octave up. Inert unless the chosen floor is below standard low E.
+        if effective_low < _DROPPED_FLOOR_CEILING_MIDI:
+            phantom = _phantom_floor_evidence(notes, effective_low)
+            verification.update(
+                {
+                    "suboctave_floor_count": phantom.floor_count,
+                    "suboctave_doubled_fraction": round(phantom.doubled_fraction, 4),
+                    "suboctave_phantom_rejected": phantom.phantom,
+                }
+            )
+            if phantom.phantom:
+                return _reject_phantom_floor(tuning, notes, notes_source, phantom, verification)
         return replace(tuning, verification=verification)
 
     # Contradiction: re-fit among candidates that can actually produce the

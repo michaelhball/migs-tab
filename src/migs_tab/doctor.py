@@ -119,6 +119,25 @@ def _check_mt3_install() -> CheckResult:
     return CheckResult("mt3 (optional)", True, f"venv + YMT3+ checkpoint ready ({size_mb:.0f} MB)")
 
 
+def _check_hand_tracking() -> CheckResult:
+    """mediapipe import + the hand-landmark model file (downloaded on first `handtrack`)."""
+    # Imported here: mediapipe is heavy and only the video step needs it.
+    try:
+        import mediapipe  # noqa: F401
+    except ImportError as e:
+        return CheckResult("hand tracking", False, f"mediapipe import failed: {e!r}")
+    from .handtrack import HAND_MODEL_PATH
+
+    if not HAND_MODEL_PATH.exists():
+        return CheckResult(
+            "hand tracking",
+            True,
+            f"mediapipe ok; model not downloaded yet ({HAND_MODEL_PATH.name}, fetched on first run)",
+        )
+    size_mb = HAND_MODEL_PATH.stat().st_size / (1024 * 1024)
+    return CheckResult("hand tracking", True, f"mediapipe ok; model ready ({size_mb:.1f} MB)")
+
+
 # Canonical, version-tracked copy of the YourMT3 driver (see
 # scripts/yourmt3/SETUP.md). third_party/YourMT3/ is gitignored, so edits to
 # the deployed copy silently drift from the tracked one — hash-compare them.
@@ -261,6 +280,7 @@ def run_checks() -> list[CheckResult]:
         _check_python_package("numpy"),
         _check_mt3_install(),
         _check_driver_sync(),
+        _check_hand_tracking(),
         _check_cache_dir(),
         _check_output_dir(),
         _check_verification(),

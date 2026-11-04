@@ -19,6 +19,7 @@ from . import doctor as doctor_mod
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
+from . import handtrack as handtrack_mod
 from . import mt3 as mt3_mod
 from . import render as render_mod
 from . import separate as separate_mod
@@ -233,6 +234,31 @@ def frame(
         paths, timestamp, label=label or None, zoom=zoom, crop=crop_tuple
     )
     console.print(f"[green]✓[/green] {out}")
+
+
+@app.command()
+def handtrack(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    fps: float = typer.Option(
+        handtrack_mod.DEFAULT_FPS, "--fps", help="Frames per second to sample"
+    ),
+    force: bool = typer.Option(False, "--force"),
+    headstock_left: bool = typer.Option(
+        False, "--headstock-left", help="Mirrored footage: the headstock is on the left"
+    ),
+) -> None:
+    """Track both hands through the video (MediaPipe); write hand_track.json."""
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Tracking hands[/bold] for {paths.video_id} at {fps} fps")
+    out = handtrack_mod.track_hands(paths, fps=fps, force=force, headstock_right=not headstock_left)
+    data = handtrack_mod.load_hand_track(paths)
+    roles = data["roles"]
+    console.print(
+        f"  [green]✓[/green] {out.name}: {roles['frames_with_fretting_hand']}/{roles['frames_total']} "
+        f"frames with the fretting hand (roles via {roles['method']}, "
+        f"{data['elapsed_s']}s)"
+    )
 
 
 @app.command(name="frames-for-clusters")

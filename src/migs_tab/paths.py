@@ -143,6 +143,14 @@ class VideoPaths:
     def verification_json(self) -> Path:
         return self.root / "verification.json"
 
+    @property
+    def hand_track_json(self) -> Path:
+        return self.root / "hand_track.json"
+
+    @property
+    def fretboard_json(self) -> Path:
+        return self.root / "fretboard.json"
+
     def output_dir(self, output_root: Path) -> Path:
         """Return the output dir for this video. Uses a slugified version of
         the video's title from info.json so files are easy to find; falls

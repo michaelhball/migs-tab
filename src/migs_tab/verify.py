@@ -63,8 +63,20 @@ VERDICT_SUPPORTED = "supported"
 VERDICT_WEAK = "weak"
 VERDICT_PHANTOM = "phantom-suspect"
 VERDICT_OCTAVE = "octave-suspect"
+# The fret decode read this note an octave away from the transcription because
+# the tracked fingers sat on that placement. The audio octave test cannot
+# arbitrate here (it is exactly the case where the audio is ambiguous), so
+# such notes are reported under their own verdict instead of as suspects.
+VERDICT_OCTAVE_VIDEO = "octave-corrected-by-video"
 VERDICT_UNSCORED = "unscored"
-VERDICTS = (VERDICT_SUPPORTED, VERDICT_WEAK, VERDICT_PHANTOM, VERDICT_OCTAVE, VERDICT_UNSCORED)
+VERDICTS = (
+    VERDICT_SUPPORTED,
+    VERDICT_WEAK,
+    VERDICT_PHANTOM,
+    VERDICT_OCTAVE,
+    VERDICT_OCTAVE_VIDEO,
+    VERDICT_UNSCORED,
+)
 
 # Octave check: a note p is 'octave-suspect' when an octave partner (p ± 12)
 # explains the post-onset audio better. Two rules, both measured on Angie:
@@ -502,6 +514,10 @@ def verify(paths: VideoPaths, out_path: Path | None = None) -> dict:
 
     # 1. Per-note salience verdicts (chunked shared CQT).
     assessments = assess_all_notes(notes, pitches, paths.guitar_stem)
+    assessments = [
+        (s, VERDICT_OCTAVE_VIDEO) if v == VERDICT_OCTAVE and "octave_corrected" in n else (s, v)
+        for (s, v), n in zip(assessments, notes, strict=True)
+    ]
 
     # 2. Cross-model agreement. The tab's default source is MT3 (fret.py
     # backend default), so frets notes match against basic-pitch as the

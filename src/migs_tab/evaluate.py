@@ -271,7 +271,11 @@ def evaluate_video(paths: VideoPaths, eval_dir: Path = EVAL_DIR) -> dict:
     for r in results:
         if r.label in hand:
             r.details["hand_index_fret_histogram"] = hand[r.label]
-    scored = [r for r in results if r.note_count]
+    # Passages whose reference is marked unverified are reported but kept out
+    # of the headline numbers (a wrong reference would otherwise be scored as
+    # pipeline error).
+    verified = {p.label for p in passages if p.confidence != "unverified"}
+    scored = [r for r in results if r.note_count and r.label in verified]
     total = sum(r.note_count for r in scored)
 
     def wmean(attr: str) -> float | None:
@@ -296,7 +300,8 @@ def evaluate_video(paths: VideoPaths, eval_dir: Path = EVAL_DIR) -> dict:
             for r in results
         ],
         "summary": {
-            "passages": len(results),
+            "passages": len(scored),
+            "passages_unverified": len(results) - len(scored),
             "notes": total,
             "position_precision": wmean("position_precision"),
             "pitch_precision": wmean("pitch_precision"),

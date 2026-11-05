@@ -1392,6 +1392,7 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
 
 
 _MAX_OPTIONS_PER_NOTE = 6  # base placements plus the best hand-supported octave readings
+_RAW_SUPPORT_MAX_COST = 0.5  # a transcribed pitch with a placement this cheap is not re-read
 
 
 def _enumerate_shapes(
@@ -1434,7 +1435,12 @@ def _enumerate_shapes(
             fret = pitch - _ACTIVE_TUNING[s]
             if 0 <= fret <= MAX_FRET:
                 opts.append((s, fret, 0, note_cost(snap, s, fret) if snap else 0.0))
-        if snap is not None:
+        # Doubt the transcribed octave only when the fingers contradict every
+        # placement of the transcribed pitch; a supported raw reading wins
+        # outright (otherwise a barre at fret 2 would let a real F#3 on the D
+        # string be re-read as F#4 on the high e).
+        raw_supported = any(hc <= _RAW_SUPPORT_MAX_COST for *_, hc in opts)
+        if snap is not None and not raw_supported:
             shifted: list[tuple[int, int, int, float]] = []
             for delta in (-12, 12):
                 p2 = pitch + delta

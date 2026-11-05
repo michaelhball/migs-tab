@@ -165,7 +165,8 @@ class Fretboard:
         self._ts = [g.t for g in self.frames]
 
     def at(self, t: float) -> FrameGeometry | None:
-        """Geometry of the sampled frame nearest ``t`` (within the borrow gap)."""
+        """Geometry of the sampled frame nearest ``t`` (within the borrow gap);
+        None when that frame has no usable fit."""
         if not self.frames:
             return None
         i = bisect.bisect_left(self._ts, t)
@@ -173,7 +174,10 @@ class Fretboard:
         k = min(cands, key=lambda k: abs(self._ts[k] - t))
         if abs(self._ts[k] - t) > _BORROW_MAX_GAP_S:
             return None
-        return self.frames[k]
+        g = self.frames[k]
+        if g.quality < _MIN_QUALITY or len(g.strings) != 6:
+            return None
+        return g
 
     def locate(self, t: float, x_norm: float, y_norm: float) -> dict | None:
         """Fret and string under a normalized landmark at time ``t``."""
@@ -594,7 +598,7 @@ def smooth_geometries(
     from drifting apart. String lines are smoothed per coefficient."""
     good = [g for g in frames if g.quality >= _MIN_QUALITY]
     if len(good) < 3:
-        return frames
+        return good  # too few fits to smooth or borrow from; never keep unfitted frames
     half = window // 2
     out: list[FrameGeometry] = []
     for i, g in enumerate(good):

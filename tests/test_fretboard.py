@@ -142,6 +142,12 @@ class TestFrameGeometry:
 
 
 class TestFretboard:
+    def test_at_ignores_unfitted_frames(self):
+        unfitted = FrameGeometry(1.0, [], 0.0, 0.0, 0.0, 0.0, math.inf, 0.0)
+        fb = Fretboard(1280, 720, True, 2.0, [unfitted])
+        assert fb.at(1.0) is None
+        assert smooth_geometries([unfitted, unfitted]) == []
+
     def test_at_picks_nearest_frame_within_gap(self):
         fb = Fretboard(1280, 720, True, 2.0, [_geom(0.0), _geom(0.5), _geom(10.0)])
         assert fb.at(0.6).t == 0.5

@@ -39,7 +39,14 @@ from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .hand_evidence import OCTAVE_SHIFT_PENALTY, HandEvidence, Snapshot, note_cost, range_penalty
+from .hand_evidence import (
+    OCTAVE_SHIFT_PENALTY,
+    HandEvidence,
+    Snapshot,
+    joint_cost,
+    note_cost,
+    range_penalty,
+)
 from .paths import VideoPaths
 
 if TYPE_CHECKING:
@@ -543,6 +550,9 @@ class Shape:
     # Cluster-local note indices whose transcribed pitch this shape reads an
     # octave away, with the semitone delta applied (hand evidence justified it).
     octave_shifts: tuple[tuple[int, int], ...] = ()
+    # Cluster-local note indices this shape leaves out as overtones of a
+    # lower cluster-mate that no fingertip is near (see _enumerate_shapes).
+    dropped: tuple[int, ...] = ()
 
     def fret_positions(self) -> list[int]:
         # Open strings (fret 0) don't really count toward hand position.
@@ -726,6 +736,7 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     note_records: list[dict] = []
     cluster_records: list[dict] = []
     octave_corrected = 0
+    unfingered_overtones: list[dict] = []
     for cid, (cluster, shapes), shape, is_ambig in zip(
         playable_ids, playable, chosen, ambiguous_flags, strict=True
     ):
@@ -744,8 +755,20 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
                 alternatives.append(octave_alt)
         shifts_by_note = dict(shape.octave_shifts)
         for note_local_idx, note_global_idx in enumerate(cluster):
-            s, f = assignment_by_note[note_local_idx]
             n = notes[note_global_idx]
+            if note_local_idx in shape.dropped:
+                unfingered_overtones.append(
+                    {
+                        "cluster_id": cid,
+                        "start": n["start"],
+                        "end": n["end"],
+                        "pitch": n["pitch"],
+                        "reason": "Sits on a partial of a lower note in the same strum, "
+                        "and no fingertip is near any placement.",
+                    }
+                )
+                continue
+            s, f = assignment_by_note[note_local_idx]
             record = {
                 "note_index": note_global_idx,
                 "start": n["start"],
@@ -770,7 +793,7 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             {
                 "cluster_id": cid,
                 "onset": min(notes[i]["start"] for i in cluster),
-                "note_indices": cluster,
+                "note_indices": [i for k, i in enumerate(cluster) if k not in shape.dropped],
                 "best_shape_cost": shape.cost,
                 "ambiguous": is_ambig,
                 "alternatives": alternatives,
@@ -801,6 +824,9 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
         # Individual notes dropped by _salvage_unplayable_cluster so their
         # cluster-mates could keep a playable shape (recorded, not silent).
         "unplayable_notes": unplayable_notes,
+        # Notes left out because they sit on a partial of a lower note in the
+        # same strum and no fingertip is near any placement (hand evidence).
+        "unfingered_overtones": unfingered_overtones,
         "tuning": {"low_to_high_midi": list(_ACTIVE_TUNING)},
         "params": {
             "max_fret": MAX_FRET,
@@ -812,6 +838,7 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             "hand_evidence": hand_evidence is not None,
             "clusters_with_hand_evidence": sum(1 for s in snapshots if s is not None),
             "octave_corrected_notes": octave_corrected,
+            "unfingered_overtone_notes": len(unfingered_overtones),
             "backend": source_backend,
             "source_notes_file": source.name,
         },
@@ -1391,8 +1418,19 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
+_LEFT_OUT = -1  # string value of the option that leaves a note out of the shape
 _MAX_OPTIONS_PER_NOTE = 6  # base placements plus the best hand-supported octave readings
 _RAW_SUPPORT_MAX_COST = 0.5  # a transcribed pitch with a placement this cheap is not re-read
+_SHAPES_PER_CLUSTER = 32
+# Semitone intervals of partials 2-6 above a fundamental. A hard-struck bass
+# string makes both transcribers report these as notes (Life by the Drop at
+# 180 s: E2 with E3, B3, E4 and G#4 above it while one finger is down).
+_PARTIAL_INTERVALS = frozenset({12, 19, 24, 28, 31})
+# Cost of leaving such a note out: the same as hand_evidence's penalty for a
+# shape that lies wholly outside the hand's range. A placement whose nearest
+# free fingertip is tracked a fret or a couple of strings off stays cheaper
+# and keeps the note. The eval scores do not move for values from 1.5 to 4.0.
+_UNFINGERED_OVERTONE_COST = 3.0
 
 
 def _enumerate_shapes(
@@ -1412,6 +1450,13 @@ def _enumerate_shapes(
     ``OCTAVE_SHIFT_PENALTY``. That is how a G#4 heard an octave high in an
     open E chord ends up as G#3 on the G string instead of dragging the
     chord up to fret 4.
+
+    With a snapshot, a note that sits on a partial of a lower cluster-mate
+    (``_PARTIAL_INTERVALS``) may also be left out of the shape at
+    ``_UNFINGERED_OVERTONE_COST``. The decode takes that option only when
+    every placement of the note costs more, that is when the note has no free
+    open string and no fingertip near any fretted placement. ``Shape.dropped``
+    lists the notes left out.
     """
     if not cluster:
         return []
@@ -1454,16 +1499,21 @@ def _enumerate_shapes(
                             shifted.append((s, fret, delta, OCTAVE_SHIFT_PENALTY))
             shifted.sort(key=lambda o: o[3])
             opts.extend(shifted[: max(0, _MAX_OPTIONS_PER_NOTE - len(opts))])
+        if not opts:
+            return []  # a pitch playable nowhere: the salvage path decides
+        if snap is not None and any(pitch - q in _PARTIAL_INTERVALS for q in pitches):
+            opts.append((_LEFT_OUT, 0, 0, 0.0))
         per_note_options.append(opts)
 
-    if any(not o for o in per_note_options):
-        return []
-
-    shapes: list[Shape] = []
     # Cartesian product of options. Bounded since cluster sizes are small
-    # (typically 1-6 notes for a chord).
+    # (typically 1-6 notes for a chord). Each candidate first gets a lower
+    # bound on its cost (every note takes its cheapest fingertip, as if
+    # fingertips could be shared).
+    candidates: list[tuple[float, float, tuple, tuple]] = []
     for combo_full in product(*per_note_options):
-        combo = tuple((s, f) for s, f, _, _ in combo_full)
+        combo = tuple((s, f) for s, f, _, _ in combo_full if s != _LEFT_OUT)
+        if not combo:
+            continue
         strings_used = [s for s, _ in combo]
         if len(set(strings_used)) != len(strings_used):
             continue  # same string assigned twice — not playable
@@ -1473,17 +1523,42 @@ def _enumerate_shapes(
             if span > MAX_HAND_SPAN:
                 continue
         effective = [_ACTIVE_TUNING[s] + f for s, f in combo]
-        assignments = tuple((i, s, f) for i, (s, f) in enumerate(combo))
-        cost = _intrinsic_cost(combo) + _chord_shape_bonus(effective, combo, frozenset(effective))
-        cost += sum(hc for _, _, _, hc in combo_full)
+        base = _intrinsic_cost(combo) + _chord_shape_bonus(effective, combo, frozenset(effective))
+        base += sum(OCTAVE_SHIFT_PENALTY for _, _, d, _ in combo_full if d)
+        base += _UNFINGERED_OVERTONE_COST * (len(combo_full) - len(combo))
         if snap is not None:
-            cost += range_penalty(snap, combo)
-        shifts = tuple((i, d) for i, (_, _, d, _) in enumerate(combo_full) if d)
-        shapes.append(Shape(assignments, cost, shifts))
+            base += range_penalty(snap, combo)
+        bound = sum(hc for s, _, d, hc in combo_full if not d and s != _LEFT_OUT)
+        candidates.append((base + bound, base, combo, combo_full))
 
-    # Limit to the K best shapes per cluster to keep Viterbi tractable.
+    # Exact hand cost (one fingertip, one place) in order of the lower bound;
+    # stop once the bound alone exceeds the K-th best exact cost. K best
+    # shapes per cluster keep Viterbi tractable.
+    candidates.sort(key=lambda c: c[0])
+    shapes: list[Shape] = []
+    joint_cache: dict[tuple, float] = {}
+    worst_kept = float("inf")
+    for bound_cost, base, combo, combo_full in candidates:
+        if len(shapes) >= _SHAPES_PER_CLUSTER and bound_cost >= worst_kept:
+            break
+        cost = base
+        if snap is not None:
+            key = tuple(sorted(combo))
+            if key not in joint_cache:
+                joint_cache[key] = joint_cost(snap, combo)
+            cost += joint_cache[key]
+        assignments = tuple(
+            (i, s, f) for i, (s, f, _, _) in enumerate(combo_full) if s != _LEFT_OUT
+        )
+        shifts = tuple((i, d) for i, (_, _, d, _) in enumerate(combo_full) if d)
+        dropped = tuple(i for i, (s, _, _, _) in enumerate(combo_full) if s == _LEFT_OUT)
+        shapes.append(Shape(assignments, cost, shifts, dropped))
+        if len(shapes) >= _SHAPES_PER_CLUSTER:
+            shapes.sort(key=lambda x: x.cost)
+            del shapes[_SHAPES_PER_CLUSTER:]
+            worst_kept = shapes[-1].cost
     shapes.sort(key=lambda x: x.cost)
-    return shapes[:32]
+    return shapes[:_SHAPES_PER_CLUSTER]
 
 
 def _salvage_unplayable_cluster(

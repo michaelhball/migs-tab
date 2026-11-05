@@ -10,6 +10,8 @@ from migs_tab.hand_evidence import (
     Fingertip,
     HandEvidence,
     Snapshot,
+    joint_cost,
+    note_cost,
     shape_cost,
 )
 
@@ -35,10 +37,29 @@ class TestShapeCost:
         assert shape_cost(snap, right) + OCTAVE_SHIFT_PENALTY < shape_cost(snap, wrong)
 
     def test_barre_index_covers_all_strings(self):
-        # F#m barre at fret 2: index tip seen over the high e string.
-        snap = _snap(("index", 1.5, 5), ("ring", 3.6, 1), ("pinky", 3.5, 2))
+        # F#m barre at fret 2: the index tip lands on the low E string.
+        snap = _snap(("index", 1.5, 0), ("ring", 3.6, 1), ("pinky", 3.5, 2))
         combo = ((0, 2), (1, 4), (2, 4), (3, 2), (4, 2), (5, 2))
         assert shape_cost(snap, combo) == 0.0
+
+    def test_one_fingertip_cannot_hold_three_notes_on_two_frets(self):
+        # Shuffle on E: index on A fret 2, pinky hovering near fret 5 on the G string.
+        snap = _snap(("index", 2.0, 1), ("middle", 3.0, 1), ("ring", 3.7, 1), ("pinky", 4.6, 3))
+        up_the_neck = ((1, 2), (3, 4), (4, 5), (5, 4))
+        each_alone = sum(note_cost(snap, s, f) for s, f in up_the_neck)
+        assert joint_cost(snap, up_the_neck) > each_alone
+
+    def test_barre_cannot_span_an_open_string(self):
+        snap = _snap(("index", 1.5, 1))
+        barre = ((1, 2), (5, 2))
+        assert joint_cost(snap, barre) == 0.0
+        with_open_b = ((1, 2), (4, 0), (5, 2))
+        assert joint_cost(snap, with_open_b) == pytest.approx(6.0)
+
+    def test_ring_finger_may_cover_adjacent_strings_at_one_fret(self):
+        snap = _snap(("index", 4.5, 0), ("ring", 6.5, 3))
+        a_shape = ((2, 7), (3, 7), (4, 7))
+        assert joint_cost(snap, a_shape) == pytest.approx(0.3 + 0.3 + 2 * 0.5)
 
     def test_open_strings_never_cost(self):
         snap = _snap(("index", 7.5, 2))

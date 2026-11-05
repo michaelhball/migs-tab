@@ -48,9 +48,9 @@
       "label": "rhythm_muted_triplets_E",
       "start": 179.6,
       "end": 201.9,
-      "source": "captions 174-204 s: the triplet rhythm demonstrated on the E chord (open E + A fret 2, adding the fourth fret). Both transcribers hear the upper strings of the open E shape (B3, E4 and a G#), so the full 022100 shape is allowed.",
+      "source": "captions 174-204 s: the triplet rhythm demonstrated on the E chord (open E + A fret 2, adding the fourth fret). The hand track shows the index finger at frets 2-3 for the whole passage and no finger at fret 1, so G fret 1 is not allowed. Both transcribers also report B3 and E4; those pitches are the third and fourth partials of the low E string, so open B and open e are allowed but unconfirmed. D fret 2 is allowed as the two-string barre of the E5 shape.",
       "confidence": "inferred",
-      "vocabulary": ["E0", "A2", "A4", "D2", "G1", "B0", "e0"]
+      "vocabulary": ["E0", "A2", "A4", "D2", "B0", "e0"]
     },
     {
       "label": "Fsharpm_chord",

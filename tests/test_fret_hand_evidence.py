@@ -54,3 +54,37 @@ class TestHandEvidenceInEnumeration:
         best = _shapes([68], snap)[0]
         (_, s, f), *_ = best.assignments
         assert fret.STANDARD_TUNING[s] + f == 56
+
+
+class TestUnfingeredOvertones:
+    def setup_method(self):
+        fret._ACTIVE_TUNING = fret.STANDARD_TUNING
+        fret._CHORD_TEMPLATES = fret._build_chord_templates_for_tuning(
+            fret.STANDARD_TUNING, "Standard"
+        )
+
+    # Shuffle on E: index on A fret 2, the other fingers hovering near frets 3-5.
+    SHUFFLE = (("index", 2.0, 1), ("middle", 3.0, 1), ("ring", 3.7, 1), ("pinky", 4.6, 3))
+    # E2 and B2 as played, plus E3, B3, E4 and G#4: partials 2-5 of the low E string.
+    PARTIALS_OF_E2 = [40, 47, 52, 59, 64, 68]
+
+    def test_overtone_with_no_finger_near_is_left_out(self):
+        best = _shapes(self.PARTIALS_OF_E2, _snap(*self.SHUFFLE))[0]
+        assert best.dropped == (5,)  # G#4: no open string left and no finger near fret 4 on e
+        assert _placements(best) == [(0, 0), (1, 2), (2, 2), (4, 0), (5, 0)]
+
+    def test_fingered_octave_above_the_bass_is_kept(self):
+        # Am: A2 open, A3 under the ring finger on the G string, fret 2.
+        snap = _snap(("index", 0.5, 4), ("middle", 1.5, 2), ("ring", 1.6, 3), ("pinky", 2.4, 4))
+        best = _shapes([45, 52, 57, 60, 64], snap)[0]
+        assert best.dropped == ()
+        assert (3, 2) in _placements(best)
+
+    def test_nothing_is_left_out_without_hand_evidence(self):
+        shapes = _shapes(self.PARTIALS_OF_E2, None)
+        assert all(sh.dropped == () for sh in shapes)
+
+    def test_note_unrelated_to_a_lower_note_is_never_left_out(self):
+        # C#4 over E2 is no partial of E2: the decode must place it even with no finger near.
+        shapes = _shapes([40, 61], _snap(*self.SHUFFLE))
+        assert all(sh.dropped == () for sh in shapes)

@@ -8,6 +8,12 @@ the string it is over. The fret decode adds ``shape_cost`` to every candidate
 them is expensive, and it may read a transcribed pitch an octave up or down
 when the fingers say so (``octave_shift_penalty``).
 
+``shape_cost`` assigns fretted notes to fingertips jointly: a fingertip
+presses one note, the index finger may barre several strings at one fret, and
+any other finger may cover adjacent strings at one fret for a small extra
+cost. Without that rule one fingertip near fret 4 would make three notes on
+three strings look fingered.
+
 Conventions: string index 0 is the low E; ``fret_cont`` is the continuous
 fret coordinate from ``FrameGeometry.fret_at`` (1.0 on wire 1, so a finger
 pressing fret 2 reads about 1.3-1.9).
@@ -39,6 +45,8 @@ _CAP_PER_NOTE = 6.0
 _HAND_RANGE_SLACK = 1.5  # fretted notes may lie this far outside the fingertip range
 _HAND_RANGE_PENALTY = 3.0
 OCTAVE_SHIFT_PENALTY = 1.5
+_MINI_BARRE_COST = 0.5  # per extra adjacent string one non-index finger covers
+_MINI_BARRE_MAX_STRINGS = 3
 
 
 @dataclass
@@ -130,25 +138,103 @@ class HandEvidence:
         return Snapshot(t=self._frames[k]["t"], fingertips=tips, quality=quality)
 
 
-def note_cost(snap: Snapshot, string: int, fret: int) -> float:
-    """Cost of one fretted note given the fingertips: distance in frets and
-    strings to the nearest fingertip beyond a little slack, capped. The index
-    finger counts as covering every string at its fret (a barre). Open
-    strings cost nothing."""
-    if fret <= 0 or not snap.fingertips:
-        return 0.0
+def finger_costs(snap: Snapshot, string: int, fret: int) -> list[float]:
+    """Cost of each fingertip being the one that presses (string, fret):
+    distance in frets and strings beyond a little slack. The index finger at
+    the note's fret covers the strings from its tip toward the treble side
+    for free (a barre runs from the tip across the higher strings)."""
     centre = fret - 0.5  # a finger pressing fret f sits mid-slot behind wire f
-    best = _CAP_PER_NOTE
+    out: list[float] = []
     for tip in snap.fingertips:
         d_fret = max(0.0, abs(tip.fret_cont - centre) - _FRET_SLACK)
-        if tip.name == "index" and d_fret == 0.0:
-            d_string = 0.0
-        elif tip.string is None:
+        if tip.string is None:
             d_string = 2.0
+        elif tip.name == "index" and d_fret == 0.0:
+            d_string = max(0.0, (tip.string - string) - _STRING_SLACK - 1.0)
         else:
             d_string = max(0.0, abs(tip.string - string) - _STRING_SLACK)
-        best = min(best, _W_FRET_MISMATCH * d_fret + _W_STRING_MISMATCH * d_string)
-    return best
+        out.append(_W_FRET_MISMATCH * d_fret + _W_STRING_MISMATCH * d_string)
+    return out
+
+
+def note_cost(snap: Snapshot, string: int, fret: int) -> float:
+    """Cost of one fretted note on its own: the cheapest fingertip, capped.
+    Open strings cost nothing. A lower bound on the note's share of
+    ``joint_cost``, where fingertips cannot be shared freely."""
+    if fret <= 0 or not snap.fingertips:
+        return 0.0
+    return min(_CAP_PER_NOTE, *finger_costs(snap, string, fret))
+
+
+def joint_cost(snap: Snapshot, combo: tuple[tuple[int, int], ...]) -> float:
+    """Cheapest way to give every fretted note of ``combo`` a fingertip.
+
+    Rules: a note left without a finger pays the per-note cap. The index
+    finger may hold several notes at one fret (a barre), but then no string
+    between the barred strings may be played open. Any other finger holds one
+    note, or adjacent strings at one fret at ``_MINI_BARRE_COST`` per extra
+    string."""
+    fretted = [(s, f) for s, f in combo if f > 0]
+    if not fretted or not snap.fingertips:
+        return 0.0
+    open_strings = {s for s, f in combo if f == 0}
+    costs = [finger_costs(snap, s, f) for s, f in fretted]
+    is_index = [tip.name == "index" for tip in snap.fingertips]
+    n, n_tips = len(fretted), len(snap.fingertips)
+    # Cheapest notes last would prune poorly; visit the hardest notes first.
+    order = sorted(range(n), key=lambda i: -min(costs[i]))
+    floor = [min(_CAP_PER_NOTE, *costs[i]) for i in order]
+    remaining = [sum(floor[k:]) for k in range(n + 1)]
+    load: list[list[int]] = [[] for _ in range(n_tips)]
+    best = [n * _CAP_PER_NOTE + 1.0]  # above the cost of nobody holding anything
+
+    def allowed(t: int, i: int) -> float | None:
+        """Extra cost of adding note i to fingertip t, or None when impossible."""
+        held = load[t]
+        if not held:
+            return 0.0
+        if fretted[held[0]][1] != fretted[i][1]:
+            return None  # one fingertip, one fret
+        strings = [fretted[k][0] for k in held] + [fretted[i][0]]
+        lo, hi = min(strings), max(strings)
+        if is_index[t]:
+            return None if any(lo < s < hi for s in open_strings) else 0.0
+        if hi - lo > _MINI_BARRE_MAX_STRINGS - 1:
+            return None
+        return _MINI_BARRE_COST
+
+    def contiguous() -> bool:
+        """Every non-index fingertip's notes sit on adjacent strings."""
+        for t, held in enumerate(load):
+            if is_index[t] or len(held) < 2:
+                continue
+            strings = [fretted[k][0] for k in held]
+            if max(strings) - min(strings) != len(strings) - 1:
+                return False
+        return True
+
+    def rec(k: int, acc: float) -> None:
+        if acc + remaining[k] >= best[0]:
+            return
+        if k == n:
+            if contiguous():
+                best[0] = acc
+            return
+        i = order[k]
+        for t in sorted(range(n_tips), key=lambda t: costs[i][t]):
+            c = costs[i][t]
+            if c >= _CAP_PER_NOTE:
+                break
+            extra = allowed(t, i)
+            if extra is None:
+                continue
+            load[t].append(i)
+            rec(k + 1, acc + c + extra)
+            load[t].pop()
+        rec(k + 1, acc + _CAP_PER_NOTE)
+
+    rec(0, 0.0)
+    return best[0]
 
 
 def range_penalty(snap: Snapshot, combo: tuple[tuple[int, int], ...]) -> float:
@@ -163,6 +249,6 @@ def range_penalty(snap: Snapshot, combo: tuple[tuple[int, int], ...]) -> float:
 
 
 def shape_cost(snap: Snapshot, combo: tuple[tuple[int, int], ...]) -> float:
-    """Extra cost of a candidate shape given where the fingers are: the sum
-    of ``note_cost`` over its fretted notes plus ``range_penalty``."""
-    return sum(note_cost(snap, s, f) for s, f in combo) + range_penalty(snap, combo)
+    """Extra cost of a candidate shape given where the fingers are:
+    ``joint_cost`` over its fretted notes plus ``range_penalty``."""
+    return joint_cost(snap, combo) + range_penalty(snap, combo)

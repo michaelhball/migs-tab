@@ -29,7 +29,12 @@ Equivalent to running `download`, `separate`, `transcribe`, and `structure` in s
 - `stems/other.wav` — guitar-isolated stem (Demucs)
 - `notes.mid`, `notes.json` — polyphonic note events (basic-pitch)
 - `structure.json` — playing segments + per-segment chord progressions + per-segment captions (librosa)
-- `frets.json` — heuristic (string, fret) per note + ambiguous flag + alternatives per cluster (Viterbi)
+- `hand_track.json` — MediaPipe landmarks of both hands at 5 fps, with the fretting hand labelled
+- `fretboard.json` — per-frame string lines and fret-wire ladder (strings via Hough lines, wires as bright columns crossing the string band, a projective ladder anchored at the nut)
+- `frets.json` — (string, fret) per note from a Viterbi search over playability, chord shapes and hand evidence (fingertip positions from the two files above); notes read an octave away from the transcription carry `pitch_raw` and `octave_corrected`
+- `verification.json` — audio-evidence scores per note and section
+
+`uv run migs-tab eval <url>` scores `frets.json` against `eval/<video_id>.json` (reference passages). `uv run migs-tab fretboard <url> --overlay-at <t1,t2>` draws the fitted geometry and fingertips on frames for a visual check.
 
 Notes:
 - Demucs on a long video takes minutes on CPU. Be patient and let it finish.
@@ -153,7 +158,14 @@ and produces `cache/<id>/frets.json`, containing one (string, fret) per note
 plus an `ambiguous` flag per cluster and a list of `alternatives`. You don't
 need to do anything here unless the user asks you to re-tune the weights.
 
-### Step 5 — Vision pass on ambiguous fret assignments (you do this — bounded)
+### Step 5 — Vision pass on ambiguous fret assignments (optional — the video step usually makes this unnecessary)
+
+The fret decode already uses the tracked fingertips (`hand_track.json` +
+`fretboard.json`), so most position questions are settled automatically.
+Run this pass only when `migs-tab eval` or the user points at a passage that
+still looks wrong, and start by checking the geometry there with
+`migs-tab fretboard <url> --overlay-at <t>` (a wrong fit explains most
+residual errors).
 
 **IMPORTANT — quota guardrail:** Each vision-pass frame is a Read on a JPEG,
 which costs Claude tokens. Never extract more than the user is willing to pay

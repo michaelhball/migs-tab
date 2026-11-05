@@ -20,6 +20,7 @@ from . import doctor as doctor_mod
 from . import download as download_mod
 from . import frames as frames_mod
 from . import fret as fret_mod
+from . import fretboard as fretboard_mod
 from . import handtrack as handtrack_mod
 from . import mt3 as mt3_mod
 from . import render as render_mod
@@ -262,6 +263,42 @@ def handtrack(
     )
 
 
+@app.command()
+def fretboard(
+    url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    fps: float = typer.Option(
+        fretboard_mod.DEFAULT_GEOMETRY_FPS, "--fps", help="Frames per second to analyse"
+    ),
+    force: bool = typer.Option(False, "--force"),
+    headstock_left: bool = typer.Option(
+        False, "--headstock-left", help="Mirrored footage: the headstock is on the left"
+    ),
+    overlay_at: str = typer.Option(
+        "",
+        "--overlay-at",
+        help="Comma-separated timestamps (s) to render debug overlays for, into cache/<id>/frames/fretboard/",
+    ),
+) -> None:
+    """Fit per-frame fretboard geometry (strings + fret wires); write fretboard.json."""
+    paths = _make_paths(url, cache_dir)
+    console.print(f"[bold]Fitting fretboard geometry[/bold] for {paths.video_id} at {fps} fps")
+    fretboard_mod.calibrate_fretboard(
+        paths, fps=fps, force=force, headstock_right=not headstock_left
+    )
+    stats = fretboard_mod.load_fretboard(paths).stats
+    console.print(
+        f"  [green]✓[/green] fretboard.json: fitted {stats.get('frames_fitted')}/"
+        f"{stats.get('frames_sampled')} frames, borrowed {stats.get('frames_borrowed')}, "
+        f"nut x median {stats.get('nut_x_median')}, {stats.get('elapsed_s')}s"
+    )
+    for t in [float(x) for x in overlay_at.split(",") if x.strip()]:
+        out = fretboard_mod.render_overlay(
+            paths, t, paths.frames_dir / "fretboard" / f"t{t:08.2f}.jpg"
+        )
+        console.print(f"  overlay → {out}")
+
+
 @app.command(name="frames-for-clusters")
 def frames_for_clusters(
     url: str = typer.Argument(..., help="YouTube URL or 11-char video ID"),
@@ -441,8 +478,14 @@ def process(
         help="Score the finished frets against the audio (writes verification.json; "
         "keeps doctor's freshness check green)",
     ),
+    video_evidence: bool = typer.Option(
+        True,
+        "--video/--no-video",
+        help="Track the fretting hand and fit the fretboard geometry from the video "
+        "so the fret decode can use them (default: on)",
+    ),
 ) -> None:
-    """Pipeline: download → separate → transcribe (both backends) → structure → frets → verify."""
+    """Pipeline: download → separate → transcribe → structure → tuning → video evidence → frets → verify."""
     paths = _make_paths(url, cache_dir)
     console.rule(f"[bold cyan]migs-tab • {paths.video_id}")
 
@@ -503,19 +546,37 @@ def process(
     console.print("[bold]6/8[/bold] tuning")
     tuning_mod.detect_tuning(paths, force=force)
 
-    console.print(f"[bold]7/8[/bold] frets (Viterbi, backend={backend})")
+    if video_evidence:
+        # Hand track + per-frame fretboard geometry: the fret decode uses them
+        # as evidence for string/fret choices. Both are CPU work on the video
+        # and independent of the audio steps above.
+        console.print("[bold]7/8[/bold] hand track (MediaPipe) + fretboard geometry")
+        try:
+            handtrack_mod.track_hands(paths, force=force)
+            fretboard_mod.calibrate_fretboard(paths, force=force)
+            fb_stats = fretboard_mod.load_fretboard(paths).stats
+            console.print(
+                f"  [green]✓[/green] geometry fitted in {fb_stats.get('frames_fitted')}/"
+                f"{fb_stats.get('frames_sampled')} sampled frames"
+            )
+        except Exception as exc:  # noqa: BLE001 — video evidence is optional
+            console.print(f"[yellow]video evidence skipped:[/yellow] {exc}")
+    else:
+        console.print("[bold]7/8[/bold] hand track + fretboard — [yellow]skipped[/yellow]")
+
+    console.print(f"[bold]8/8[/bold] frets (Viterbi, backend={backend})")
     fret_mod.assign_frets(paths, force=force, backend=backend)
 
     if run_verify:
         # Keeps verification.json at least as fresh as the artifacts above,
         # so doctor's freshness check stays green after every pipeline run.
-        console.print("[bold]8/8[/bold] verify (salience + agreement + section scores)")
+        console.print("[bold]·[/bold] verify (salience + agreement + section scores)")
         try:
             _print_verification(verify_mod.verify(paths))
         except verify_mod.VerifyError as exc:
             console.print(f"[yellow]verify skipped:[/yellow] {exc}")
     else:
-        console.print("[bold]8/8[/bold] verify — [yellow]skipped[/yellow]")
+        console.print("[bold]·[/bold] verify — [yellow]skipped[/yellow]")
 
     console.rule("[bold green]done — LLM steps now run via the /migs-tab skill")
     _print_status(paths)
@@ -610,6 +671,8 @@ def _print_status(paths: VideoPaths) -> None:
         ("structure.json", paths.structure_json),
         ("sections.json", paths.sections_json),
         ("tuning.json", paths.tuning_json),
+        ("hand_track.json", paths.hand_track_json),
+        ("fretboard.json", paths.fretboard_json),
         ("frets.json", paths.frets_json),
         ("tips.md", paths.tips_md),
     ]

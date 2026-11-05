@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import statistics
 from dataclasses import dataclass
 
 from .fretboard import Fretboard, load_fretboard
@@ -26,6 +27,8 @@ from .paths import VideoPaths
 
 FINGER_NAMES = ("index", "middle", "ring", "pinky")
 _TIME_TOL_S = 0.15  # nearest tracked frame must be this close to the onset
+_SMOOTH_FRAMES = 3  # frames pooled per snapshot (set to 1 for the nearest frame only)
+_SMOOTH_WINDOW_S = 0.25
 # Costs (same units as fret.py's shape costs: an open string is worth -0.8,
 # a full open-chord template -4.0).
 _W_FRET_MISMATCH = 2.5  # per fret beyond the slack
@@ -83,7 +86,10 @@ class HandEvidence:
         return cls(track, load_fretboard(paths))
 
     def at(self, t: float) -> Snapshot | None:
-        """Fingertip positions from the tracked frame nearest ``t``, or None."""
+        """Fingertip positions around ``t``: the nearest tracked frame must be
+        within ``_TIME_TOL_S``; up to ``_SMOOTH_FRAMES`` frames within
+        ``_SMOOTH_WINDOW_S`` are pooled per finger (median fret, most common
+        string) to damp landmark jitter."""
         if not self._frames:
             return None
         i = bisect.bisect_left(self._ts, t)
@@ -91,18 +97,37 @@ class HandEvidence:
         k = min(cands, key=lambda k: abs(self._ts[k] - t))
         if abs(self._ts[k] - t) > _TIME_TOL_S:
             return None
-        frame = self._frames[k]
-        geom = self._fb.at(frame["t"])
-        if geom is None:
+        near = sorted(
+            (abs(self._ts[j] - t), j)
+            for j in range(
+                max(0, k - _SMOOTH_FRAMES), min(len(self._frames), k + _SMOOTH_FRAMES + 1)
+            )
+            if abs(self._ts[j] - t) <= _SMOOTH_WINDOW_S
+        )[:_SMOOTH_FRAMES]
+        per_finger: list[list[Fingertip]] = [[] for _ in FINGER_NAMES]
+        quality = 0.0
+        for _, j in near:
+            frame = self._frames[j]
+            geom = self._fb.at(frame["t"])
+            if geom is None:
+                continue
+            quality = max(quality, geom.quality)
+            hand = next(h for h in frame["hands"] if h["role"] == "fretting")
+            for fi, (name, lm) in enumerate(zip(FINGER_NAMES, FINGERTIPS, strict=True)):
+                lx, ly = hand["landmarks"][lm]
+                x, y = lx * self._w, ly * self._h
+                string, dist = geom.string_at(x, y)
+                per_finger[fi].append(Fingertip(name, geom.fret_at(x), string, dist))
+        if not per_finger[0]:
             return None
-        hand = next(h for h in frame["hands"] if h["role"] == "fretting")
         tips: list[Fingertip] = []
-        for name, lm in zip(FINGER_NAMES, FINGERTIPS, strict=True):
-            lx, ly = hand["landmarks"][lm]
-            x, y = lx * self._w, ly * self._h
-            string, dist = geom.string_at(x, y)
-            tips.append(Fingertip(name, geom.fret_at(x), string, dist))
-        return Snapshot(t=frame["t"], fingertips=tips, quality=geom.quality)
+        for name, obs in zip(FINGER_NAMES, per_finger, strict=True):
+            fret = statistics.median(o.fret_cont for o in obs)
+            strings = [o.string for o in obs if o.string is not None]
+            string = statistics.mode(strings) if strings else None
+            dist = statistics.median(o.string_dist for o in obs)
+            tips.append(Fingertip(name, fret, string, dist))
+        return Snapshot(t=self._frames[k]["t"], fingertips=tips, quality=quality)
 
 
 def note_cost(snap: Snapshot, string: int, fret: int) -> float:

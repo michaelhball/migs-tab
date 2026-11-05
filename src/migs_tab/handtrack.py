@@ -176,7 +176,9 @@ def iter_frames(video: Path, fps: float):
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_MIN_CONFIDENCE = 0.3
+# 0.15 finds the fretting hand in 97% of Angie's frames against 62% at 0.3,
+# with 70 detections scored below 0.6 out of 7995 (measured 2026-11-05).
+DEFAULT_MIN_CONFIDENCE = 0.15
 
 
 def _make_landmarker(model_path: Path, min_confidence: float = DEFAULT_MIN_CONFIDENCE):

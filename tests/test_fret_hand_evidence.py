@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 from migs_tab import fret
 from migs_tab.hand_evidence import Fingertip, Snapshot
 
@@ -88,3 +90,44 @@ class TestUnfingeredOvertones:
         # C#4 over E2 is no partial of E2: the decode must place it even with no finger near.
         shapes = _shapes([40, 61], _snap(*self.SHUFFLE))
         assert all(sh.dropped == () for sh in shapes)
+
+
+class TestSeenElsewhere:
+    """Clusters without a snapshot use placements the hand confirmed elsewhere."""
+
+    def setup_method(self):
+        fret._ACTIVE_TUNING = fret.STANDARD_TUNING
+        fret._CHORD_TEMPLATES = fret._build_chord_templates_for_tuning(
+            fret.STANDARD_TUNING, "Standard"
+        )
+
+    @staticmethod
+    def _shapes(pitches: list[int], seen: dict | None):
+        notes = [{"pitch": p, "start": 1.0, "end": 1.5} for p in pitches]
+        return fret._enumerate_shapes(notes, list(range(len(notes))), None, seen)
+
+    def test_pitch_goes_where_the_hand_was_seen_playing_it(self):
+        assert _placements(self._shapes([64], None)[0]) == [(5, 0)]  # open e by default
+        seen = {64: Counter({(4, 5): 9, (5, 0): 1})}
+        assert _placements(self._shapes([64], seen)[0]) == [(4, 5)]
+
+    def test_octave_reading_the_hand_confirmed_is_offered(self):
+        seen = {68: Counter({(3, 1): 8, (5, 4): 2})}  # G#4 was G#3 on the G string 8 times of 10
+        best = self._shapes([68], seen)[0]
+        assert _placements(best) == [(3, 1)]
+        assert best.octave_shifts == ((0, -12),)
+
+    def test_too_few_sightings_change_nothing(self):
+        seen = {64: Counter({(4, 5): 3})}
+        assert _placements(self._shapes([64], seen)[0]) == [(5, 0)]
+
+    def test_sightings_count_only_placements_a_snapshot_confirms(self):
+        snap = _snap(("index", 0.5, 4), ("middle", 1.5, 2), ("ring", 1.6, 3), ("pinky", 2.4, 4))
+        notes = [{"pitch": p, "start": 1.0, "end": 1.5} for p in (45, 57, 69)]
+        on_finger = fret.Shape(
+            ((0, 1, 0), (1, 3, 2), (2, 5, 5)), 0.0
+        )  # A0, G2, and e5 with no finger
+        seen = fret._seen_placements(
+            notes, [0, 1], [([0, 1, 2], []), ([0], [])], [on_finger, on_finger], [snap, None]
+        )
+        assert seen == {45: Counter({(1, 0): 1}), 57: Counter({(3, 2): 1})}

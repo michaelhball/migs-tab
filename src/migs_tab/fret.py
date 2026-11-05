@@ -33,7 +33,7 @@ velocity fields, no ``overtone_artifacts`` key).
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -730,6 +730,18 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             )
 
     chosen = _viterbi(playable)
+
+    # Second pass for clusters the camera did not show the hand for: place
+    # each pitch where the hand was seen playing it elsewhere in the video.
+    seen = _seen_placements(notes, playable_ids, playable, chosen, snapshots)
+    unseen = [k for k, cid in enumerate(playable_ids) if snapshots[cid] is None]
+    if seen and unseen:
+        for k in unseen:
+            cluster = playable[k][0]
+            shapes = _enumerate_shapes(notes, cluster, None, seen)
+            if shapes:
+                playable[k] = (cluster, shapes)
+        chosen = _viterbi(playable)
     ambiguous_flags = _flag_ambiguous(playable, chosen)
 
     # Build per-note output.
@@ -1431,12 +1443,21 @@ _PARTIAL_INTERVALS = frozenset({12, 19, 24, 28, 31})
 # free fingertip is tracked a fret or a couple of strings off stays cheaper
 # and keeps the note. The eval scores do not move for values from 1.5 to 4.0.
 _UNFINGERED_OVERTONE_COST = 3.0
+# Where the camera does not show the fretting hand (a wide shot, the hand out
+# of frame), a transcribed pitch is placed where the hand was seen playing
+# that pitch elsewhere in the video. A placement pays this weight times the
+# share of sightings that went elsewhere; pitches seen fewer than
+# _SEEN_MIN_COUNT times get no such cost.
+_W_SEEN_ELSEWHERE = 2.5
+_SEEN_MIN_COUNT = 5
+_SEEN_OCTAVE_MIN_SHARE = 0.3  # an octave re-read is offered when this share of sightings used it
 
 
 def _enumerate_shapes(
     notes: list[dict],
     cluster: list[int],
     snap: Snapshot | None = None,
+    seen: dict[int, Counter] | None = None,
 ) -> list[Shape]:
     """Enumerate all playable (string, fret) assignments for one cluster.
 
@@ -1457,6 +1478,11 @@ def _enumerate_shapes(
     every placement of the note costs more, that is when the note has no free
     open string and no fingertip near any fretted placement. ``Shape.dropped``
     lists the notes left out.
+
+    Without a snapshot, ``seen`` (transcribed pitch -> placements the hand was
+    seen using for it elsewhere in the video, from ``_seen_placements``) adds
+    ``_W_SEEN_ELSEWHERE`` times the share of sightings that went elsewhere,
+    and offers the octave re-reads the hand confirmed for that pitch.
     """
     if not cluster:
         return []
@@ -1471,38 +1497,48 @@ def _enumerate_shapes(
     pitches = [notes[i]["pitch"] for i in cluster]
     pitch_set = frozenset(pitches)
 
-    # For each note in the cluster, list its (string, fret, octave delta)
-    # candidates with their hand cost.
-    per_note_options: list[list[tuple[int, int, int, float]]] = []
+    # Options per note: (string, fret, octave delta, fixed cost, hand bound).
+    # The fixed cost is added as is. The hand bound is the note's cheapest
+    # fingertip on its own, a lower bound on its share of the joint hand cost.
+    per_note_options: list[list[tuple[int, int, int, float, float]]] = []
     for pitch in pitches:
-        opts: list[tuple[int, int, int, float]] = []
+        opts: list[tuple[int, int, int, float, float]] = []
         for s in range(NUM_STRINGS):
             fret = pitch - _ACTIVE_TUNING[s]
             if 0 <= fret <= MAX_FRET:
-                opts.append((s, fret, 0, note_cost(snap, s, fret) if snap else 0.0))
-        # Doubt the transcribed octave only when the fingers contradict every
-        # placement of the transcribed pitch; a supported raw reading wins
-        # outright (otherwise a barre at fret 2 would let a real F#3 on the D
-        # string be re-read as F#4 on the high e).
-        raw_supported = any(hc <= _RAW_SUPPORT_MAX_COST for *_, hc in opts)
-        if snap is not None and not raw_supported:
-            shifted: list[tuple[int, int, int, float]] = []
-            for delta in (-12, 12):
-                p2 = pitch + delta
-                if p2 in pitch_set:
-                    continue  # would duplicate a cluster-mate; the overtone pass owns that
-                for s in range(NUM_STRINGS):
-                    fret = p2 - _ACTIVE_TUNING[s]
-                    if 0 < fret <= MAX_FRET:
-                        hc = note_cost(snap, s, fret)
-                        if hc == 0.0:  # only readings a fingertip supports
-                            shifted.append((s, fret, delta, OCTAVE_SHIFT_PENALTY))
-            shifted.sort(key=lambda o: o[3])
-            opts.extend(shifted[: max(0, _MAX_OPTIONS_PER_NOTE - len(opts))])
+                opts.append((s, fret, 0, 0.0, note_cost(snap, s, fret) if snap else 0.0))
         if not opts:
             return []  # a pitch playable nowhere: the salvage path decides
-        if snap is not None and any(pitch - q in _PARTIAL_INTERVALS for q in pitches):
-            opts.append((_LEFT_OUT, 0, 0, 0.0))
+        if snap is not None:
+            # Doubt the transcribed octave only when the fingers contradict
+            # every placement of the transcribed pitch; a supported raw reading
+            # wins outright (otherwise a barre at fret 2 would let a real F#3
+            # on the D string be re-read as F#4 on the high e).
+            if not any(bound <= _RAW_SUPPORT_MAX_COST for *_, bound in opts):
+                room = max(0, _MAX_OPTIONS_PER_NOTE - len(opts))
+                for delta in (-12, 12):
+                    p2 = pitch + delta
+                    if p2 in pitch_set:
+                        continue  # would duplicate a cluster-mate; the overtone pass owns that
+                    for s in range(NUM_STRINGS):
+                        fret = p2 - _ACTIVE_TUNING[s]
+                        # Only readings a fingertip supports.
+                        if 0 < fret <= MAX_FRET and note_cost(snap, s, fret) == 0.0 and room:
+                            opts.append((s, fret, delta, OCTAVE_SHIFT_PENALTY, 0.0))
+                            room -= 1
+            if any(pitch - q in _PARTIAL_INTERVALS for q in pitches):
+                opts.append((_LEFT_OUT, 0, 0, _UNFINGERED_OVERTONE_COST, 0.0))
+        elif seen and sum(seen.get(pitch, Counter()).values()) >= _SEEN_MIN_COUNT:
+            sightings = seen[pitch]
+            total = sum(sightings.values())
+            for (s, fret), count in sightings.items():
+                delta = _ACTIVE_TUNING[s] + fret - pitch
+                if delta and count / total >= _SEEN_OCTAVE_MIN_SHARE:
+                    opts.append((s, fret, delta, 0.0, 0.0))
+            opts = [
+                (s, fret, delta, _W_SEEN_ELSEWHERE * (1 - sightings[(s, fret)] / total), 0.0)
+                for s, fret, delta, _, _ in opts
+            ]
         per_note_options.append(opts)
 
     # Cartesian product of options. Bounded since cluster sizes are small
@@ -1511,7 +1547,7 @@ def _enumerate_shapes(
     # fingertips could be shared).
     candidates: list[tuple[float, float, tuple, tuple]] = []
     for combo_full in product(*per_note_options):
-        combo = tuple((s, f) for s, f, _, _ in combo_full if s != _LEFT_OUT)
+        combo = tuple((s, f) for s, f, *_ in combo_full if s != _LEFT_OUT)
         if not combo:
             continue
         strings_used = [s for s, _ in combo]
@@ -1524,11 +1560,10 @@ def _enumerate_shapes(
                 continue
         effective = [_ACTIVE_TUNING[s] + f for s, f in combo]
         base = _intrinsic_cost(combo) + _chord_shape_bonus(effective, combo, frozenset(effective))
-        base += sum(OCTAVE_SHIFT_PENALTY for _, _, d, _ in combo_full if d)
-        base += _UNFINGERED_OVERTONE_COST * (len(combo_full) - len(combo))
+        base += sum(fixed for *_, fixed, _ in combo_full)
         if snap is not None:
             base += range_penalty(snap, combo)
-        bound = sum(hc for s, _, d, hc in combo_full if not d and s != _LEFT_OUT)
+        bound = sum(hand for *_, hand in combo_full)
         candidates.append((base + bound, base, combo, combo_full))
 
     # Exact hand cost (one fingertip, one place) in order of the lower bound;
@@ -1547,11 +1582,9 @@ def _enumerate_shapes(
             if key not in joint_cache:
                 joint_cache[key] = joint_cost(snap, combo)
             cost += joint_cache[key]
-        assignments = tuple(
-            (i, s, f) for i, (s, f, _, _) in enumerate(combo_full) if s != _LEFT_OUT
-        )
-        shifts = tuple((i, d) for i, (_, _, d, _) in enumerate(combo_full) if d)
-        dropped = tuple(i for i, (s, _, _, _) in enumerate(combo_full) if s == _LEFT_OUT)
+        assignments = tuple((i, o[0], o[1]) for i, o in enumerate(combo_full) if o[0] != _LEFT_OUT)
+        shifts = tuple((i, o[2]) for i, o in enumerate(combo_full) if o[2])
+        dropped = tuple(i for i, o in enumerate(combo_full) if o[0] == _LEFT_OUT)
         shapes.append(Shape(assignments, cost, shifts, dropped))
         if len(shapes) >= _SHAPES_PER_CLUSTER:
             shapes.sort(key=lambda x: x.cost)
@@ -1559,6 +1592,27 @@ def _enumerate_shapes(
             worst_kept = shapes[-1].cost
     shapes.sort(key=lambda x: x.cost)
     return shapes[:_SHAPES_PER_CLUSTER]
+
+
+def _seen_placements(
+    notes: list[dict],
+    playable_ids: list[int],
+    playable: list[tuple[list[int], list[Shape]]],
+    chosen: list[Shape],
+    snapshots: list[Snapshot | None],
+) -> dict[int, Counter]:
+    """Transcribed pitch -> count of each (string, fret) the decode chose for
+    it while a fingertip snapshot confirmed the choice: an open string in a
+    cluster with a snapshot, or a fretted note with a fingertip on it."""
+    seen: dict[int, Counter] = {}
+    for cid, (cluster, _), shape in zip(playable_ids, playable, chosen, strict=True):
+        snap = snapshots[cid]
+        if snap is None:
+            continue
+        for local, s, f in shape.assignments:
+            if f == 0 or note_cost(snap, s, f) <= _RAW_SUPPORT_MAX_COST:
+                seen.setdefault(notes[cluster[local]]["pitch"], Counter())[(s, f)] += 1
+    return seen
 
 
 def _salvage_unplayable_cluster(

@@ -9,7 +9,7 @@ Given a YouTube URL, `migs-tab` will:
 3. Transcribe the isolated guitar into note events with two models: [YourMT3+](https://github.com/mimbres/YourMT3) (drives the tab) and [Spotify basic-pitch](https://github.com/spotify/basic-pitch) (ornament hints and cross-checks).
 4. Identify the song's playing segments and their chord progressions, and detect the tuning and capo.
 5. Track the fretting hand through the video (MediaPipe) and fit the fretboard's strings and fret wires in every sampled frame, so each fingertip can be read as a (string, fret) position.
-6. Assign each note to a string and fret with a Viterbi search that scores playability, chord shapes, and where the fingers actually are. A note the transcriber heard an octave off is read at the octave the fingers support.
+6. Assign each note to a string and fret with a Viterbi search that scores playability, chord shapes, and where the fingers actually are. A note the transcriber heard an octave off is read at the octave the fingers support. Each fingertip presses one place (the index finger may barre), so one fingertip cannot make several notes look fingered. A note that sits on an overtone of a lower note in the same strum and has no fingertip near any placement is left out and listed in `frets.json` under `unfingered_overtones`. Where the camera does not show the hand, each pitch goes where the hand was seen playing it elsewhere in the video.
 7. Score the result against the audio (`verify`) and, where reference passages exist, against known fingerings (`eval`).
 8. Write a section-by-section ASCII tab, a Markdown wrapper, a chord chart and MusicXML, and (with the Claude skill described below) a tips document extracted from the instructor's commentary.
 

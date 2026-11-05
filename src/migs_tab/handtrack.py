@@ -176,7 +176,10 @@ def iter_frames(video: Path, fps: float):
 # ---------------------------------------------------------------------------
 
 
-def _make_landmarker(model_path: Path):
+DEFAULT_MIN_CONFIDENCE = 0.3
+
+
+def _make_landmarker(model_path: Path, min_confidence: float = DEFAULT_MIN_CONFIDENCE):
     # Imported here: mediapipe is a heavy optional dependency, and importing it
     # at module load would slow every CLI invocation that never touches video.
     import mediapipe as mp
@@ -187,15 +190,17 @@ def _make_landmarker(model_path: Path):
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.3,
-        min_hand_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
+        min_hand_detection_confidence=min_confidence,
+        min_hand_presence_confidence=min_confidence,
+        min_tracking_confidence=min_confidence,
     )
     return vision.HandLandmarker.create_from_options(opts), mp
 
 
-def detect_hands(video: Path, fps: float, model_path: Path) -> list[FrameRecord]:
-    landmarker, mp = _make_landmarker(model_path)
+def detect_hands(
+    video: Path, fps: float, model_path: Path, min_confidence: float = DEFAULT_MIN_CONFIDENCE
+) -> list[FrameRecord]:
+    landmarker, mp = _make_landmarker(model_path, min_confidence)
     records: list[FrameRecord] = []
     for i, t, frame in iter_frames(video, fps):
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame))

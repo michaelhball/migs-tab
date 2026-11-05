@@ -16,9 +16,9 @@
       "label": "intro_E7_money_chord",
       "start": 230.4,
       "end": 246.2,
-      "source": "sections.json: the E7 'money chord' voicing with the high D on the B string, fret 3",
-      "confidence": "stated",
-      "vocabulary": ["E0", "A2", "D0", "G1", "B3", "B0", "e0"]
+      "source": "sections.json: the E7 'money chord' voicing with the high D on the B string, fret 3, described as the A minor shape slid up two frets with the middle finger lifted (G string fret 4, B string fret 3 over open strings). The standard open E7 shape is allowed as well because the instructor compares the two.",
+      "confidence": "inferred",
+      "vocabulary": ["E0", "A2", "D0", "G1", "B3", "B0", "e0", "A0", "G4"]
     },
     {
       "label": "intro_G_with_sus4",

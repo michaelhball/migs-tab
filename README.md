@@ -142,7 +142,7 @@ migs-tab/
 ## Limitations
 
 - Acoustic single-guitar tutorials only. Electric guitar with effects and multi-guitar arrangements are out of scope.
-- The video step needs the usual tutorial framing: a mostly static camera in front of the player with the fretboard in view. It copes with the guitar drifting a few tens of pixels (geometry is fitted per frame) but not with cuts between camera angles, and a capo makes the capo read as the nut.
+- The video step needs the usual tutorial framing: a mostly static camera in front of the player with the fretboard in view. It copes with the guitar drifting a few tens of pixels (geometry is fitted per frame) and with cuts between close-ups and wide shots (a wide shot gets no geometry, so onsets in it are decoded from audio alone; Justin Guitar's Song for George fits 60% of its frames this way). A hand-held or moving camera gets no geometry at all, and a capo makes the capo read as the nut.
 - Tuning and capo are detected from the captions and the audio; detection can be wrong on songs that never use the lowest string.
 - String choice for notes the fingers do not disambiguate (a chord strummed while the hand is off camera, open strings) falls back to playability heuristics.
 - The transcription step depends on auto-captions being available on the YouTube video for the best `tips.md` and `sections.json` output. If captions are missing the audio analysis still works, but the LLM-driven section labeling will be less precise.

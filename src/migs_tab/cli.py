@@ -8,6 +8,7 @@ subscription instead of the API.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -545,6 +546,56 @@ def status(
 ) -> None:
     """Show which artifacts are cached for a given video."""
     _print_status(_make_paths(url, cache_dir))
+
+
+@app.command(name="eval")
+def eval_cmd(
+    url: str = typer.Argument("", help="YouTube URL or 11-char video ID (omit with --all)"),
+    all_videos: bool = typer.Option(False, "--all", help="Score every video with a reference file"),
+    cache_dir: Path = typer.Option(DEFAULT_CACHE_DIR, "--cache-dir"),
+    as_json: bool = typer.Option(False, "--json", help="Print the full report as JSON"),
+) -> None:
+    """Score frets.json against the hand-written reference passages in eval/."""
+    from . import evaluate as evaluate_mod
+
+    if all_videos:
+        ids = sorted(p.stem for p in evaluate_mod.EVAL_DIR.glob("*.json"))
+    elif url:
+        ids = [extract_video_id(url)]
+    else:
+        raise typer.BadParameter("give a video or --all")
+    reports = []
+    for vid in ids:
+        paths = VideoPaths(vid, cache_dir=cache_dir)
+        try:
+            report = evaluate_mod.evaluate_video(paths)
+        except FileNotFoundError as exc:
+            console.print(f"[yellow]{vid}: skipped — {exc}[/yellow]")
+            continue
+        reports.append(report)
+        if as_json:
+            continue
+        s = report["summary"]
+        console.print(
+            f"\n[bold]{vid}[/bold]  {s['passages']} passages, {s['notes']} notes  "
+            f"position {s['position_precision']}  pitch {s['pitch_precision']}  "
+            f"recall {s['vocab_recall']}  high-fret strays {s['high_fret_strays']}"
+            + (f"  sequence F1 {s['sequence_f1']}" if s["sequence_f1"] is not None else "")
+        )
+        for p in report["passages"]:
+            wrong = ", ".join(
+                f"{'EADGBe'[w['string']]}{w['fret']}×{w['count']}"
+                for w in p["most_common_wrong_positions"][:4]
+            )
+            console.print(
+                f"  {p['label']:<32} n={p['note_count']:>4}  pos={p['position_precision']}  "
+                f"pitch={p['pitch_precision']}  recall={p['vocab_recall']}  "
+                f"strays={p['high_fret_strays']}"
+                + (f"  seqF1={p['sequence_f1']}" if p["sequence_f1"] is not None else "")
+                + (f"   wrong: {wrong}" if wrong else "")
+            )
+    if as_json:
+        console.print_json(json.dumps(reports))
 
 
 def _print_status(paths: VideoPaths) -> None:

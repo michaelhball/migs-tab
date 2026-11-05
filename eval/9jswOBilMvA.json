@@ -1,0 +1,80 @@
+{
+  "video_id": "9jswOBilMvA",
+  "title": "Life by the Drop (SRV) — OneChart guitar lessons",
+  "tuning": "Standard, no capo (the instructor names A, D, E and F#m shapes played in open position)",
+  "notes": "Vocabulary tokens are <string letter><fret>, strings E A D G B e low to high. Sources: the instructor's spoken fingerings in captions.txt and the tab he shows on screen (visible at 317 s for the F#m riff). Confidence 'stated' = the instructor says it in words; 'inferred' = follows from his description plus the chord shape.",
+  "passages": [
+    {
+      "label": "intro_riff_slow",
+      "start": 61.6,
+      "end": 73.0,
+      "source": "captions 58-77 s: 'the intro starts on the open A string, 1 2 3 4 5 6'; riff pitches A C D D# E G in open position",
+      "confidence": "inferred",
+      "vocabulary": ["A0", "A3", "D0", "D1", "D2", "G0", "G2"],
+      "sequence": [
+        "e|------------|",
+        "B|------------|",
+        "G|----------0-|",
+        "D|----0-1-2---|",
+        "A|-0-3--------|",
+        "E|------------|"
+      ]
+    },
+    {
+      "label": "intro_triplet_feel",
+      "start": 84.4,
+      "end": 115.7,
+      "source": "same riff repeated slowly while counting triplets (captions 77-112 s)",
+      "confidence": "inferred",
+      "vocabulary": ["A0", "A3", "D0", "D1", "D2", "G0", "G2"]
+    },
+    {
+      "label": "power_chord_A",
+      "start": 138.5,
+      "end": 140.6,
+      "source": "captions 138-142 s: 'for your A you're playing the open A string and your second fret D string'",
+      "confidence": "stated",
+      "vocabulary": ["A0", "D2", "D4"]
+    },
+    {
+      "label": "power_chord_D_and_E",
+      "start": 147.1,
+      "end": 157.3,
+      "source": "captions 142-156 s: D = open D + second fret G; E = open E + second fret A; 'lean up to that fourth fret with your third finger'. The transcribed audio shows the full open E shape ringing when he strums, so its upper strings are allowed too.",
+      "confidence": "inferred",
+      "vocabulary": ["D0", "G2", "G4", "E0", "A2", "A4", "D2", "G1", "B0", "e0"]
+    },
+    {
+      "label": "rhythm_muted_triplets_E",
+      "start": 179.6,
+      "end": 201.9,
+      "source": "captions 174-204 s: the triplet rhythm demonstrated on the E chord (open E + A fret 2, adding the fourth fret). Both transcribers hear the upper strings of the open E shape (B3, E4 and a G#), so the full 022100 shape is allowed.",
+      "confidence": "inferred",
+      "vocabulary": ["E0", "A2", "A4", "D2", "G1", "B0", "e0"]
+    },
+    {
+      "label": "Fsharpm_chord",
+      "start": 209.2,
+      "end": 222.4,
+      "source": "captions 204-222 s: 'on the F minors he's just going... long strums on the higher strings'; F#m barre at fret 2",
+      "confidence": "inferred",
+      "vocabulary": ["E2", "A4", "D4", "G2", "B2", "e2"]
+    },
+    {
+      "label": "final_chorus_hammer_pull_riff",
+      "start": 309.0,
+      "end": 324.6,
+      "source": "captions 307-325 s: 'open D, two quick hammer on to four, back to two, then a really fast hammer on and pull off'; on-screen tab at 317 s reads 0 2 4 2 (2) (2) 2 2 4 2 4; the riff resolves into the F#m barre ('you're back there for your F minor'), so that shape is allowed too",
+      "confidence": "stated",
+      "vocabulary": ["D0", "D2", "D4", "E2", "A4", "D4", "G2", "B2", "e2"],
+      "sequence": [
+        "e|------------------------|",
+        "B|------------------------|",
+        "G|------------------------|",
+        "D|-0-2-4-2-2-2-2-2-4-2-4--|",
+        "A|------------------------|",
+        "E|------------------------|"
+      ]
+    }
+  ]
+}

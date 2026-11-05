@@ -39,6 +39,7 @@ from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .hand_evidence import OCTAVE_SHIFT_PENALTY, HandEvidence, Snapshot, note_cost, range_penalty
 from .paths import VideoPaths
 
 if TYPE_CHECKING:
@@ -539,6 +540,9 @@ class Shape:
 
     assignments: tuple[tuple[int, int, int], ...]
     cost: float
+    # Cluster-local note indices whose transcribed pitch this shape reads an
+    # octave away, with the semitone delta applied (hand evidence justified it).
+    octave_shifts: tuple[tuple[int, int], ...] = ()
 
     def fret_positions(self) -> list[int]:
         # Open strings (fret 0) don't really count toward hand position.
@@ -657,7 +661,17 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     notes, clusters = _filter_harmonic_overtones(
         notes, clusters, skip_octave=evidence_contexts is not None
     )
-    cluster_shapes = [_enumerate_shapes(notes, c) for c in clusters]
+    # Hand evidence from the video (hand_track.json + fretboard.json): a
+    # fingertip snapshot per cluster onset, when both files exist and the
+    # tracker saw the fretting hand near that moment.
+    hand_evidence = HandEvidence.load(paths)
+    snapshots: list[Snapshot | None] = [
+        hand_evidence.at(min(notes[i]["start"] for i in c)) if hand_evidence else None
+        for c in clusters
+    ]
+    cluster_shapes = [
+        _enumerate_shapes(notes, c, snap) for c, snap in zip(clusters, snapshots, strict=True)
+    ]
 
     # Drop clusters where no playable shape exists — these are pitches
     # outside guitar range or impossible-to-finger combinations. Annotate them.
@@ -671,12 +685,14 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     playable: list[tuple[list[int], list[Shape]]] = []
     unplayable_clusters: list[dict] = []
     unplayable_notes: list[dict] = []
-    for cidx, (cluster, shapes) in enumerate(zip(clusters, cluster_shapes, strict=True)):
+    for cidx, (cluster, shapes, snap) in enumerate(
+        zip(clusters, cluster_shapes, snapshots, strict=True)
+    ):
         if not shapes and len(cluster) >= 2:
             # Salvage: drop only the members that block fingerability
             # instead of silently deleting the whole cluster (singletons
             # keep the old whole-cluster path — there is nothing to save).
-            kept, kept_shapes, salvage_dropped = _salvage_unplayable_cluster(notes, cluster)
+            kept, kept_shapes, salvage_dropped = _salvage_unplayable_cluster(notes, cluster, snap)
             if kept:
                 cluster, shapes = kept, kept_shapes
                 for i, reason in salvage_dropped:
@@ -709,6 +725,7 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
     # Build per-note output.
     note_records: list[dict] = []
     cluster_records: list[dict] = []
+    octave_corrected = 0
     for cid, (cluster, shapes), shape, is_ambig in zip(
         playable_ids, playable, chosen, ambiguous_flags, strict=True
     ):
@@ -725,6 +742,7 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             octave_alt = _octave_alternative(notes, cluster, shape)
             if octave_alt is not None:
                 alternatives.append(octave_alt)
+        shifts_by_note = dict(shape.octave_shifts)
         for note_local_idx, note_global_idx in enumerate(cluster):
             s, f = assignment_by_note[note_local_idx]
             n = notes[note_global_idx]
@@ -732,13 +750,19 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
                 "note_index": note_global_idx,
                 "start": n["start"],
                 "end": n["end"],
-                "pitch": n["pitch"],
+                # Always tuning[string] + fret; equals the transcribed pitch
+                # unless hand evidence justified an octave reading.
+                "pitch": _ACTIVE_TUNING[s] + f,
                 "string": s,  # 0..5, 0 = low E
                 "tab_string": NUM_STRINGS - s,  # 1..6, 1 = low E? — no, 6 = low E
                 "fret": f,
                 "cluster_id": cid,
                 "ambiguous": is_ambig,
             }
+            if note_local_idx in shifts_by_note:
+                record["pitch_raw"] = n["pitch"]
+                record["octave_corrected"] = shifts_by_note[note_local_idx]
+                octave_corrected += 1
             if evidence_contexts is not None:
                 record["velocity"] = n["velocity"]
             note_records.append(record)
@@ -785,6 +809,9 @@ def assign_frets(paths: VideoPaths, force: bool = False, backend: str = "mt3") -
             "max_cluster_duration": MAX_CLUSTER_DURATION,
             "ambiguity_margin": _AMBIGUITY_MARGIN,
             "audio_evidence": evidence_contexts is not None,
+            "hand_evidence": hand_evidence is not None,
+            "clusters_with_hand_evidence": sum(1 for s in snapshots if s is not None),
+            "octave_corrected_notes": octave_corrected,
             "backend": source_backend,
             "source_notes_file": source.name,
         },
@@ -1364,14 +1391,26 @@ def _cluster_notes_by_onset(notes: list[dict]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
+_MAX_OPTIONS_PER_NOTE = 6  # base placements plus the best hand-supported octave readings
+
+
 def _enumerate_shapes(
     notes: list[dict],
     cluster: list[int],
+    snap: Snapshot | None = None,
 ) -> list[Shape]:
     """Enumerate all playable (string, fret) assignments for one cluster.
 
     Each note must go on a distinct string; the fretted frets (excluding
     open notes at fret 0) must fit within MAX_HAND_SPAN.
+
+    With a hand-evidence ``snap`` for the cluster's onset, every shape also
+    pays ``hand_evidence.shape_cost`` (fretted notes far from any fingertip
+    are expensive), and a note may be read an octave above or below its
+    transcribed pitch when a fingertip sits on that placement, at
+    ``OCTAVE_SHIFT_PENALTY``. That is how a G#4 heard an octave high in an
+    open E chord ends up as G#3 on the G string instead of dragging the
+    chord up to fret 4.
     """
     if not cluster:
         return []
@@ -1383,27 +1422,42 @@ def _enumerate_shapes(
         # cluster would otherwise cost O(options^N) per iteration.
         return []
 
-    # For each note in the cluster, list its (string, fret) candidates.
-    per_note_options: list[list[tuple[int, int]]] = []
-    for nidx in cluster:
-        pitch = notes[nidx]["pitch"]
-        opts: list[tuple[int, int]] = []
+    pitches = [notes[i]["pitch"] for i in cluster]
+    pitch_set = frozenset(pitches)
+
+    # For each note in the cluster, list its (string, fret, octave delta)
+    # candidates with their hand cost.
+    per_note_options: list[list[tuple[int, int, int, float]]] = []
+    for pitch in pitches:
+        opts: list[tuple[int, int, int, float]] = []
         for s in range(NUM_STRINGS):
             fret = pitch - _ACTIVE_TUNING[s]
             if 0 <= fret <= MAX_FRET:
-                opts.append((s, fret))
+                opts.append((s, fret, 0, note_cost(snap, s, fret) if snap else 0.0))
+        if snap is not None:
+            shifted: list[tuple[int, int, int, float]] = []
+            for delta in (-12, 12):
+                p2 = pitch + delta
+                if p2 in pitch_set:
+                    continue  # would duplicate a cluster-mate; the overtone pass owns that
+                for s in range(NUM_STRINGS):
+                    fret = p2 - _ACTIVE_TUNING[s]
+                    if 0 < fret <= MAX_FRET:
+                        hc = note_cost(snap, s, fret)
+                        if hc == 0.0:  # only readings a fingertip supports
+                            shifted.append((s, fret, delta, OCTAVE_SHIFT_PENALTY))
+            shifted.sort(key=lambda o: o[3])
+            opts.extend(shifted[: max(0, _MAX_OPTIONS_PER_NOTE - len(opts))])
         per_note_options.append(opts)
 
     if any(not o for o in per_note_options):
         return []
 
-    pitches = [notes[i]["pitch"] for i in cluster]
-    pitch_set = frozenset(pitches)
-
     shapes: list[Shape] = []
     # Cartesian product of options. Bounded since cluster sizes are small
     # (typically 1-6 notes for a chord).
-    for combo in product(*per_note_options):
+    for combo_full in product(*per_note_options):
+        combo = tuple((s, f) for s, f, _, _ in combo_full)
         strings_used = [s for s, _ in combo]
         if len(set(strings_used)) != len(strings_used):
             continue  # same string assigned twice — not playable
@@ -1412,9 +1466,14 @@ def _enumerate_shapes(
             span = max(fretted) - min(fretted)
             if span > MAX_HAND_SPAN:
                 continue
+        effective = [_ACTIVE_TUNING[s] + f for s, f in combo]
         assignments = tuple((i, s, f) for i, (s, f) in enumerate(combo))
-        cost = _intrinsic_cost(combo) + _chord_shape_bonus(pitches, combo, pitch_set)
-        shapes.append(Shape(assignments, cost))
+        cost = _intrinsic_cost(combo) + _chord_shape_bonus(effective, combo, frozenset(effective))
+        cost += sum(hc for _, _, _, hc in combo_full)
+        if snap is not None:
+            cost += range_penalty(snap, combo)
+        shifts = tuple((i, d) for i, (_, _, d, _) in enumerate(combo_full) if d)
+        shapes.append(Shape(assignments, cost, shifts))
 
     # Limit to the K best shapes per cluster to keep Viterbi tractable.
     shapes.sort(key=lambda x: x.cost)
@@ -1424,6 +1483,7 @@ def _enumerate_shapes(
 def _salvage_unplayable_cluster(
     notes: list[dict],
     cluster: list[int],
+    snap: Snapshot | None = None,
 ) -> tuple[list[int], list[Shape], list[tuple[int, str]]]:
     """Reduce a cluster with no playable shape to its largest playable core.
 
@@ -1451,12 +1511,12 @@ def _salvage_unplayable_cluster(
             dropped.append((i, "Pitch out of range on every string for this tuning."))
         else:
             kept.append(i)
-    shapes = _enumerate_shapes(notes, kept) if kept else []
+    shapes = _enumerate_shapes(notes, kept, snap) if kept else []
     while kept and not shapes:
         weakest = min(kept, key=lambda i: (notes[i].get("velocity", 0), -notes[i]["pitch"]))
         kept.remove(weakest)
         dropped.append((weakest, "No playable shape together with the rest of the cluster."))
-        shapes = _enumerate_shapes(notes, kept) if kept else []
+        shapes = _enumerate_shapes(notes, kept, snap) if kept else []
     return kept, shapes, dropped
 
 

@@ -1,0 +1,48 @@
+{
+  "video_id": "wS_i91qxQYM",
+  "title": "Angie (Rolling Stones) — Shutup & Play",
+  "tuning": "Standard, no capo",
+  "notes": "Vocabulary tokens are <string letter><fret>, strings E A D G B e low to high. Sources: section descriptions in sections.json (written from the captions) and the open-position voicings the instructor demonstrates. Confidence 'stated' = named in the captions; 'inferred' = standard open voicing of the named chord. The user plays this song and should correct these.",
+  "passages": [
+    {
+      "label": "intro_opening_motif",
+      "start": 118.7,
+      "end": 138.8,
+      "source": "sections.json: 12th-fret natural harmonic, A minor downstroke, upstroke on E and B strings, downstroke with little finger on high-E fret 3 (the 'Gino' note)",
+      "confidence": "stated",
+      "vocabulary": ["A0", "D2", "G2", "B1", "e0", "e3", "A12", "E0"]
+    },
+    {
+      "label": "intro_E7_money_chord",
+      "start": 230.4,
+      "end": 246.2,
+      "source": "sections.json: the E7 'money chord' voicing with the high D on the B string, fret 3",
+      "confidence": "stated",
+      "vocabulary": ["E0", "A2", "D0", "G1", "B3", "B0", "e0"]
+    },
+    {
+      "label": "intro_G_with_sus4",
+      "start": 447.6,
+      "end": 460.7,
+      "source": "sections.json: open G with a sus4 (C on the B string, fret 1)",
+      "confidence": "inferred",
+      "vocabulary": ["E3", "A2", "D0", "G0", "B0", "B1", "e3"]
+    },
+    {
+      "label": "intro_C_suspended_voicing",
+      "start": 554.3,
+      "end": 559.4,
+      "source": "sections.json: open C with a suspended fourth (F on the e string, fret 1) and the D on the B string, fret 3",
+      "confidence": "inferred",
+      "vocabulary": ["A3", "D2", "G0", "B1", "B3", "e0", "e1"]
+    },
+    {
+      "label": "bridge_Dm_Am_progression",
+      "start": 1266.3,
+      "end": 1283.3,
+      "source": "sections.json: G, Dm, Am, C, F in open position during the bridge",
+      "confidence": "inferred",
+      "vocabulary": ["D0", "G2", "B3", "e1", "A0", "D2", "B1", "e0", "E3", "A2", "G0", "B0", "e3", "A3", "E1", "D3", "G1"]
+    }
+  ]
+}

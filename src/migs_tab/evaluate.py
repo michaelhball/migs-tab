@@ -221,6 +221,34 @@ def score_passage(
     )
 
 
+def _hand_fret_histograms(paths: VideoPaths, passages: list[Passage]) -> dict[str, dict[int, int]]:
+    """Where the index fingertip actually is during each passage, from the
+    hand track and fretboard geometry: a {fret: frames} histogram. A passage
+    whose reference assumes open chords while the index finger sits at fret
+    5-7 has a wrong reference, not a wrong pipeline."""
+    if not (paths.hand_track_json.exists() and paths.fretboard_json.exists()):
+        return {}
+    # Imported here: hand_evidence pulls in the fretboard module; the evaluator
+    # must stay usable without any video artifacts.
+    from .hand_evidence import HandEvidence
+
+    ev = HandEvidence.load(paths)
+    if ev is None:
+        return {}
+    out: dict[str, dict[int, int]] = {}
+    for p in passages:
+        hist: dict[int, int] = {}
+        t = p.start
+        while t < p.end:
+            snap = ev.at(t)
+            if snap is not None and snap.index_fret is not None:
+                hist[snap.index_fret] = hist.get(snap.index_fret, 0) + 1
+            t += 0.2
+        if hist:
+            out[p.label] = dict(sorted(hist.items(), key=lambda kv: -kv[1])[:5])
+    return out
+
+
 def _open_midis(paths: VideoPaths) -> tuple[int, ...]:
     if paths.tuning_json.exists():
         d = json.loads(paths.tuning_json.read_text())
@@ -239,6 +267,10 @@ def evaluate_video(paths: VideoPaths, eval_dir: Path = EVAL_DIR) -> dict:
     notes = json.loads(paths.frets_json.read_text())["notes"]
     open_midis = _open_midis(paths)
     results = [score_passage(p, notes, open_midis) for p in passages]
+    hand = _hand_fret_histograms(paths, passages)
+    for r in results:
+        if r.label in hand:
+            r.details["hand_index_fret_histogram"] = hand[r.label]
     scored = [r for r in results if r.note_count]
     total = sum(r.note_count for r in scored)
 

@@ -655,6 +655,13 @@ def eval_cmd(
                 + (f"  seqF1={p['sequence_f1']}" if p["sequence_f1"] is not None else "")
                 + (f"   wrong: {wrong}" if wrong else "")
             )
+            hand = p.get("hand_index_fret_histogram")
+            if hand:
+                console.print(
+                    "      index finger at fret: "
+                    + ", ".join(f"{f}×{n}" for f, n in hand.items())
+                    + "  (tracked frames)"
+                )
     if as_json:
         console.print_json(json.dumps(reports))
 

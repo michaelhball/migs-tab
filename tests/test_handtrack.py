@@ -6,6 +6,7 @@ model); the pure functions around it are.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 
 import numpy as np
@@ -93,6 +94,10 @@ class TestFrameStream:
         assert "rgb24" in cmd
         assert cmd[-1] == "-"
 
+    @pytest.mark.skipif(
+        shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+        reason="ffmpeg and ffprobe are not on PATH",
+    )
     def test_iter_frames_decodes_a_synthetic_video(self, tmp_path):
         video = tmp_path / "v.mp4"
         # 2 s of a 64x48 test pattern at 10 fps -> sampled at 5 fps = 10 frames.

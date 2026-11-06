@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # tests/test_handtrack.py encodes and decodes a short synthetic video.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v3
         with:
